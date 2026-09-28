@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.16)
+project(splinesketch LANGUAGES CXX)
+
+add_library(splinesketch INTERFACE)
+target_include_directories(splinesketch INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(splinesketch INTERFACE cxx_std_17)
+
+option(SPLINESKETCH_BUILD_TESTS "Build the test executable" ON)
+if(SPLINESKETCH_BUILD_TESTS)
+  enable_testing()
+  add_executable(splinesketch_tests tests/splinesketch_tests.cpp)
+  target_link_libraries(splinesketch_tests PRIVATE splinesketch)
+  add_test(NAME splinesketch_tests COMMAND splinesketch_tests)
+endif()
+
+option(SPLINESKETCH_BUILD_BENCHMARK "Build the throughput benchmark" OFF)
+if(SPLINESKETCH_BUILD_BENCHMARK)
+  add_executable(splinesketch_benchmark benchmarks/throughput.cpp)
+  target_link_libraries(splinesketch_benchmark PRIVATE splinesketch)
+  add_executable(splinesketch_criteria_benchmark benchmarks/criteria.cpp)
+  target_link_libraries(splinesketch_criteria_benchmark PRIVATE splinesketch)
+endif()
