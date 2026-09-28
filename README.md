@@ -196,4 +196,4 @@ describe how this library differs from the algorithm and prototype in the paper.
 
 ## License
 
-A license has not yet been added to this repository.
+Licensed under the MIT License. See [LICENSE](LICENSE) for the full text.
