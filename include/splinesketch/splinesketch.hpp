@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -36,28 +37,33 @@ class SplineSketch {
     if (count_ == std::numeric_limits<std::uint64_t>::max())
       throw std::overflow_error("observation count overflow");
     value = canonical(value);
-    ++count_;
     auto found = heavy_.find(value);
     if (found != heavy_.end()) {
       ++found->second.residual;
       ++found->second.exact;
+      ++count_;
       return;
     }
     if (heavy_.size() < capacity_ - 1) {
       heavy_.emplace(value, Heavy{1, 1});
+      ++count_;
       return;
     }
-    // A full MG table consumes one unit from each counter and the new item.
-    for (auto it = heavy_.begin(); it != heavy_.end();) {
-      if (--it->second.residual == 0) {
-        forward(it->first, it->second.exact);
-        it = heavy_.erase(it);
-      } else {
-        ++it;
-      }
+    std::size_t forwarded = 1;
+    for (const auto& item : heavy_) {
+      if (item.second.residual == 1) ++forwarded;
     }
-    forward(value, 1);
-    if (pending_.size() >= capacity_) consolidate();
+    const std::size_t pending_after = pending_.size() + forwarded;
+    if (pending_after >= capacity_) {
+      // Consolidation can allocate after editing nodes, so do it on a copy.
+      SplineSketch updated(*this);
+      updated.add_with_full_table(value);
+      *this = std::move(updated);
+    } else {
+      // All subsequent edits are non-allocating once the buffer has room.
+      pending_.reserve(pending_after);
+      add_with_full_table(value);
+    }
   }
 
   std::uint64_t count() const noexcept { return count_; }
@@ -142,53 +148,18 @@ class SplineSketch {
 
   void consolidate() {
     if (pending_.empty()) return;
-    advance_epoch();
-    Snapshot before{nodes_, pending_, {}};
-    before.prepare();
-    if (nodes_.empty()) {
-      initialize(before);
-    } else {
-      const double min_value = before.pending.front().first;
-      const double max_value = before.pending.back().first;
-      if (min_value < nodes_.front().x)
-        nodes_.insert(nodes_.begin(), Node{min_value});
-      if (max_value > nodes_.back().x)
-        nodes_.push_back(Node{max_value});
-      reestimate(before);
-    }
-    pending_.clear();
-    reduce_to_capacity();
-    rebalance(before);
+    SplineSketch updated(*this);
+    updated.consolidate_in_place();
+    *this = std::move(updated);
   }
 
   void resize(std::size_t new_capacity) {
     if (new_capacity < 6 || new_capacity > std::numeric_limits<std::size_t>::max() / 4)
       throw std::invalid_argument("bucket count must be at least 6");
-    consolidate();
-    if (new_capacity == capacity_) return;
-    if (new_capacity > capacity_ + capacity_ / 4 ||
-        capacity_ > new_capacity + new_capacity / 4)
-      for (auto& node : nodes_) node.protected_threshold = false;
-    capacity_ = new_capacity;
-    if (nodes_.capacity() < capacity_ + 2) nodes_.reserve(capacity_ + 2);
-    pending_.reserve(capacity_ + 2);
-    heavy_.reserve(capacity_);
-    shrink_heavy();
-    consolidate();
-    reduce_to_capacity();
-    if (nodes_.size() < capacity_) {
-      Snapshot before{nodes_, {}, {}};
-      while (nodes_.size() < capacity_) {
-        const auto split = best_split(false);
-        if (split == npos) break;
-        split_at(split, before);
-      }
-    }
-    const auto room = std::numeric_limits<std::uint64_t>::max() - count_;
-    const auto next_epoch = count_ + std::min<std::uint64_t>(room, count_ / 4 + 1);
-    epoch_end_ = std::max<std::uint64_t>(next_epoch,
-                                          static_cast<std::uint64_t>(4 * capacity_));
-    rebuild(nodes_);
+    if (new_capacity == capacity_ && pending_.empty()) return;
+    SplineSketch updated(*this);
+    updated.resize_in_place(new_capacity);
+    *this = std::move(updated);
   }
 
   void merge(const SplineSketch& other) {
@@ -200,8 +171,8 @@ class SplineSketch {
     if (std::numeric_limits<std::uint64_t>::max() - count_ < other.count_)
       throw std::overflow_error("observation count overflow");
     SplineSketch a(*this), b(other);
-    a.consolidate();
-    b.consolidate();
+    a.consolidate_in_place();
+    b.consolidate_in_place();
     SplineSketch result(capacity_);
     result.count_ = a.count_ + b.count_;
     const SplineSketch& larger = a.count_ >= b.count_ ? a : b;
@@ -233,11 +204,75 @@ class SplineSketch {
     for (const auto& item : b.heavy_)
       result.insert_summary(item.first, item.second);
     result.reduce_to_capacity();
-    result.consolidate();
+    result.consolidate_in_place();
     *this = std::move(result);
   }
 
  private:
+  void add_with_full_table(double value) {
+    // A full MG table consumes one unit from each counter and the new item.
+    for (auto it = heavy_.begin(); it != heavy_.end();) {
+      if (--it->second.residual == 0) {
+        forward(it->first, it->second.exact);
+        it = heavy_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    forward(value, 1);
+    ++count_;
+    if (pending_.size() >= capacity_) consolidate_in_place();
+  }
+
+  void consolidate_in_place() {
+    if (pending_.empty()) return;
+    advance_epoch();
+    Snapshot before{nodes_, pending_, {}};
+    before.prepare();
+    if (nodes_.empty()) {
+      initialize(before);
+    } else {
+      const double min_value = before.pending.front().first;
+      const double max_value = before.pending.back().first;
+      if (min_value < nodes_.front().x)
+        nodes_.insert(nodes_.begin(), Node{min_value});
+      if (max_value > nodes_.back().x)
+        nodes_.push_back(Node{max_value});
+      reestimate(before);
+    }
+    pending_.clear();
+    reduce_to_capacity();
+    rebalance(before);
+  }
+
+  void resize_in_place(std::size_t new_capacity) {
+    consolidate_in_place();
+    if (new_capacity == capacity_) return;
+    if (new_capacity > capacity_ + capacity_ / 4 ||
+        capacity_ > new_capacity + new_capacity / 4)
+      for (auto& node : nodes_) node.protected_threshold = false;
+    capacity_ = new_capacity;
+    if (nodes_.capacity() < capacity_ + 2) nodes_.reserve(capacity_ + 2);
+    pending_.reserve(capacity_ + 2);
+    heavy_.reserve(capacity_);
+    shrink_heavy();
+    consolidate_in_place();
+    reduce_to_capacity();
+    if (nodes_.size() < capacity_) {
+      Snapshot before{nodes_, {}, {}};
+      while (nodes_.size() < capacity_) {
+        const auto split = best_split(false);
+        if (split == npos) break;
+        split_at(split, before);
+      }
+    }
+    const auto room = std::numeric_limits<std::uint64_t>::max() - count_;
+    const auto next_epoch = count_ + std::min<std::uint64_t>(room, count_ / 4 + 1);
+    epoch_end_ = std::max<std::uint64_t>(next_epoch,
+                                          static_cast<std::uint64_t>(4 * capacity_));
+    rebuild(nodes_);
+  }
+
   struct Node {
     double x = 0;
     long double mass = 0;
@@ -636,5 +671,8 @@ class SplineSketch {
     }
   }
 };
+
+static_assert(std::is_nothrow_move_assignable<SplineSketch>::value,
+              "SplineSketch requires a non-throwing commit of updated state");
 
 }  // namespace splinesketch

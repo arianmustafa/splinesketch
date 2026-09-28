@@ -128,7 +128,8 @@ bucket resolution; it is not an error tolerance.
 | Observation count would exceed `UINT64_MAX` during addition or merge | Throw `std::overflow_error`. |
 | `rank(-infinity)` / `rank(+infinity)` | Return zero / the total count converted to `double`. |
 
-Allocating operations can also throw allocation exceptions. Inputs `-0.0` and
+Allocating operations can also throw allocation exceptions. Failed mutating
+operations leave the sketch unchanged. Inputs `-0.0` and
 `+0.0` are treated as the same value. Const queries can run concurrently on an
 otherwise unmodified sketch. Mutation requires external synchronization with
 all other accesses to that sketch.
