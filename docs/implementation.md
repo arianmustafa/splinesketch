@@ -92,6 +92,8 @@ and can remove protected thresholds if needed. Rebalancing is limited to
 does not enforce the batch-size condition used in the paper's proof.
 The [theorems in §3.3 and Appendix B](https://arxiv.org/pdf/2504.01206v3#page=12)
 therefore require a separate applicability analysis for this code.
+The [reproducible accuracy results](accuracy.md) measure observed rank error
+across several capacities and workloads; they do not establish that guarantee.
 
 ## Differences from the paper
 

@@ -18,7 +18,7 @@ not provide a certified worst-case error bound for a given capacity.
 
 [Installation](#installation) · [Quick start](#quick-start) ·
 [API](#api) · [Tests and benchmarks](#tests-and-benchmarks) ·
-[Implementation notes](docs/implementation.md)
+[Accuracy results](docs/accuracy.md) · [Implementation notes](docs/implementation.md)
 
 ## Features
 
@@ -138,6 +138,8 @@ all other accesses to that sketch.
 
 - There is no certified worst-case error bound for this implementation.
   See the [differences from the paper](docs/implementation.md#differences-from-the-paper).
+- In a [reproducible synthetic accuracy run](docs/accuracy.md), median absolute
+  rank error was 0.057% of stream size and the worst observed error was 27.923%.
 - Integer ranks above `2^53` may round to the same `double` value.
 - Intermediate arithmetic uses `long double`. On platforms where its range
   equals `double`'s, extreme finite inputs can overflow intermediate calculations.
@@ -162,9 +164,12 @@ cmake --build build --config Release
 Tests are enabled by default. The [test suite](tests/splinesketch_tests.cpp)
 covers exact small inputs, monotonicity, quantile inversion, extreme values,
 buffered updates, large weighted counts, merges, and resizing. Accuracy checks
-use fixed synthetic streams and do not establish a general error bound.
+use fixed synthetic streams and do not establish a general error bound. CTest
+also runs the [accuracy benchmark](benchmarks/accuracy.cpp), which compares a
+reproducible matrix of capacities, data shapes, merges, and resizes with exact
+ranks and checks count and rank validity.
 
-To also build the benchmarks:
+The accuracy runner is built with the tests. To also build the timing benchmarks:
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
@@ -173,6 +178,7 @@ cmake --build build --config Release
 
 ./build/splinesketch_benchmark
 ./build/splinesketch_criteria_benchmark 128
+./build/splinesketch_accuracy_benchmark
 ```
 
 With a multi-configuration generator, executables are in `build/Release/`.
@@ -181,8 +187,9 @@ With a multi-configuration generator, executables are in `build/Release/`.
 | --- | --- |
 | [Throughput](benchmarks/throughput.cpp) | One million normal samples at capacity 128, followed by 100,000 rank and 10,000 quantile queries. Reports microseconds per operation; update timing includes a final consolidation. |
 | [Criteria](benchmarks/criteria.cpp) | 10,000 parts, each updating 30 sketches. Reports mean, p99, p99.9, and maximum milliseconds per part. The optional argument sets capacity, defaulting to 128. Includes automatic consolidations, with no queries or final flush. |
+| [Accuracy](benchmarks/accuracy.cpp) | Exact-rank comparison across 5 capacities, 5 data shapes, 3 update workflows, and 3 seeds. Reports median, p95, and worst observed rank error as a percent of stream size. See [method and results](docs/accuracy.md). |
 
-Both benchmarks generate input before timing. Throughput queries use the
+Both timing benchmarks generate input before timing. Throughput queries use the
 consolidated sketch with its frequency table retained. These are local synthetic
 workloads, not reproductions of the paper's accuracy or storage comparisons.
 
