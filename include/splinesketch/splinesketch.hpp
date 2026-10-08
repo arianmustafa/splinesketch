@@ -19,6 +19,10 @@ namespace splinesketch {
 // inserted values <= x. Heavy hitters are held exactly in a Misra-Gries table.
 // The implementation follows Sections 3 and 4 of arXiv:2504.01206v3.
 class SplineSketch {
+  template<bool> friend class BasicPaperSplineSketch;
+#ifdef SPLINESKETCH_TESTING
+  friend struct SplineSketchInvariantInspector;
+#endif
   static_assert(sizeof(double) == sizeof(std::uint64_t) &&
                 std::numeric_limits<double>::is_iec559,
                 "SplineSketch requires IEEE-754 binary64 doubles");
@@ -30,6 +34,17 @@ class SplineSketch {
     nodes_.reserve(buckets + 2);
     pending_.reserve(buckets + 2);
     heavy_.reserve(buckets);
+  }
+
+  SplineSketch(const SplineSketch&) = default;
+  SplineSketch(SplineSketch&&) noexcept = default;
+  SplineSketch& operator=(SplineSketch&&) noexcept = default;
+  SplineSketch& operator=(const SplineSketch& other) {
+    if (this != &other) {
+      SplineSketch updated(other);
+      *this = std::move(updated);
+    }
+    return *this;
   }
 
   void add(double value) {
@@ -274,11 +289,17 @@ class SplineSketch {
   }
 
   struct Node {
-    double x = 0;
+    // Group aligned fields to avoid a separate padding block after x.
     long double mass = 0;
     long double prefix = 0;
     long double slope = 0;
+    double x = 0;
     bool protected_threshold = false;
+    // Preserve the original x, mass, prefix, slope, protection argument order.
+    Node(double value = 0, long double weight = 0, long double sum = 0,
+         long double derivative = 0, bool protection = false) noexcept
+        : mass(weight), prefix(sum), slope(derivative), x(value),
+          protected_threshold(protection) {}
   };
   struct Heavy {
     std::uint64_t residual = 0;
@@ -339,7 +360,12 @@ class SplineSketch {
     return static_cast<double>((static_cast<long double>(a) + b) / 2);
   }
   static long double span(double a, double b) {
-    return static_cast<long double>(b) - a;
+    const long double result = static_cast<long double>(b) - a;
+#ifdef SPLINESKETCH_VERIFY_GUARANTEES
+    if (!std::isfinite(result))
+      throw std::logic_error("finite endpoints overflow long double span");
+#endif
+    return result;
   }
   static long double endpoint_slope(long double h0, long double h1,
                                     long double d0, long double d1) {
@@ -348,7 +374,8 @@ class SplineSketch {
     if (d1 == 0 || slope > 3 * d0) slope = 3 * d0;
     return slope;
   }
-  static void rebuild(std::vector<Node>& nodes) {
+  template<class Nodes>
+  static void rebuild(Nodes& nodes) {
     long double sum = 0;
     for (auto& node : nodes) {
       sum += node.mass;
@@ -553,9 +580,18 @@ class SplineSketch {
   void reduce_to_capacity() {
     const auto old_size = nodes_.size();
     while (nodes_.size() > capacity_) {
-      auto join = best_join(npos, false, true);
+      auto join = best_join();
+      if (join == npos) join = best_join(npos, false, true);
       if (join == npos) join = best_join(npos, false, false);
       if (join == npos) break;
+#ifdef SPLINESKETCH_VERIFY_GUARANTEES
+      // This path is allowed by the production algorithm but not by the
+      // paper's Definition 1. Stop at the first incompatible transition.
+      if (nodes_[join].protected_threshold)
+        throw std::logic_error("capacity reduction removes a protected threshold");
+      if (nodes_[join].mass + nodes_[join + 1].mass > 0.75L * bound())
+        throw std::logic_error("capacity reduction exceeds the join mass limit");
+#endif
       join_at(join);
     }
     // resize() and merge() may take a snapshot immediately after reduction.
