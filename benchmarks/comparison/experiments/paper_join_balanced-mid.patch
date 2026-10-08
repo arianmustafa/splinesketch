@@ -1,0 +1,47 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -732,7 +732,11 @@
+         std::fabs(next / hn - mass / h) / (h + hn)) * h * h;
+     // Extreme binary64 arithmetic may overflow. Ordering remains deterministic;
+     // candidate legality never depends on this optional heuristic.
+-    return std::isfinite(value) ? value : std::numeric_limits<long double>::max();
++    long double cost = value;
++    if constexpr (TrackBounds) {
++      if (joined) cost += 0.25L * (nodes_[right].upper - nodes_[right].atom - nodes_[i - 1].lower);
++    }
++    return std::isfinite(cost) ? cost : std::numeric_limits<long double>::max();
+   }
+   struct JoinCandidates {
+     using Candidate = std::pair<long double, std::size_t>;
+@@ -928,7 +932,11 @@
+       const long double following = next != none ? nodes[next].mass : 0;
+       const long double value = std::max(std::fabs(mass / h - nodes[left].mass / hp) / (h + hp),
+           std::fabs(following / hn - mass / h) / (h + hn)) * h * h;
+-      return std::isfinite(value) ? value : std::numeric_limits<long double>::max();
++      long double cost = value;
++      if constexpr (TrackBounds) {
++        if (joined) cost += 0.25L * (nodes[right].upper - nodes[right].atom - nodes[left].lower);
++      }
++      return std::isfinite(cost) ? cost : std::numeric_limits<long double>::max();
+     }
+     bool heuristic_eligible(Id id) const {
+       return splittable(id) && sketch.nodes_[id].mass >
+@@ -1109,7 +1117,17 @@
+             ? snapshot.nodes[old].prefix : spline_rank(snapshot.nodes, x);
+         const long double value = old_rank + (pending ? snapshot.sums[pending - 1] : 0);
+         const long double mass = std::max(0.0L, value - previous);
+-        set_bounds(sketch.nodes_[id], snapshot, old, pending);
++        if constexpr (TrackBounds) {
++          auto updated = sketch.nodes_[id];
++          set_bounds(updated, snapshot, old, pending);
++          // Join keys depend on neighbouring integer bounds. Detach all
++          // affected keys BEFORE mutating an endpoint, even if mass is equal.
++          if (updated.lower != sketch.nodes_[id].lower || updated.upper != sketch.nodes_[id].upper ||
++              updated.atom != sketch.nodes_[id].atom) mark_neighbours(id);
++          sketch.nodes_[id].lower = updated.lower;
++          sketch.nodes_[id].upper = updated.upper;
++          sketch.nodes_[id].atom = updated.atom;
++        }
+         if (mass != sketch.nodes_[id].mass) {
+           mark_neighbours(id);
+           sketch.nodes_[id].mass = mass;

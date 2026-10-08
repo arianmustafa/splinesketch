@@ -1,0 +1,340 @@
+--- a/include/splinesketch/splinesketch.hpp
++++ b/include/splinesketch/splinesketch.hpp
+@@ -277,11 +277,17 @@
+   }
+ 
+   struct Node {
+-    double x = 0;
++    // Group aligned fields to avoid a separate padding block after x.
+     long double mass = 0;
+     long double prefix = 0;
+     long double slope = 0;
++    double x = 0;
+     bool protected_threshold = false;
++    // Preserve the original x, mass, prefix, slope, protection argument order.
++    Node(double value = 0, long double weight = 0, long double sum = 0,
++         long double derivative = 0, bool protection = false) noexcept
++        : mass(weight), prefix(sum), slope(derivative), x(value),
++          protected_threshold(protection) {}
+   };
+   struct Heavy {
+     std::uint64_t residual = 0;
+--- a/include/splinesketch/certified_splinesketch.hpp
++++ b/include/splinesketch/certified_splinesketch.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <splinesketch/splinesketch.hpp>
++#include <variant>
+ 
+ namespace splinesketch {
+ namespace detail {
+@@ -11,7 +12,7 @@
+  public:
+   struct Entry {
+     double value;
+-    std::uint64_t gap, delta, prefix;
++    std::uint64_t delta, prefix;  // gap = prefix - previous prefix
+   };
+   struct Bounds { std::uint64_t lower, upper; };
+   struct Insertion { std::size_t index; Entry entry; };
+@@ -19,39 +20,65 @@
+   explicit RankEnvelope(std::size_t capacity) : capacity_(capacity) {}
+   std::uint64_t count() const noexcept { return count_; }
+   std::size_t capacity() const noexcept { return capacity_; }
+-  std::size_t size() const noexcept { return entries_.size(); }
++  std::size_t size() const noexcept {
++    return std::visit([](const auto& entries) { return entries.size(); }, storage_);
++  }
+   std::uint64_t threshold() const noexcept {
+     return std::max<std::uint64_t>(1, count_ / capacity_);
+   }
+   std::uint64_t uncertainty() const noexcept { return uncertainty_; }
+-  const std::vector<Entry>& entries() const noexcept { return entries_; }
+-
+-  // Allocate before changing the spline. commit_add cannot throw thereafter.
++  Entry entry(std::size_t index) const noexcept {
++    return std::visit([&](const auto& entries) { return widen(entries[index]); }, storage_);
++  }
++
++  // Allocate before changing the spline. Promotion changes only representation;
++  // a subsequent spline failure leaves observations and certificates unchanged.
+   Insertion prepare_add(double value) {
+-    auto next = upper(value);
+-    const std::size_t index = static_cast<std::size_t>(next - entries_.begin());
+-    const std::uint64_t prefix = index ? entries_[index - 1].prefix + 1 : 1;
+-    const std::uint64_t delta = index && index < entries_.size()
+-        ? entries_[index].gap + entries_[index].delta - 1 : 0;
+-    if (entries_.size() == entries_.capacity()) {
+-      const auto limit = entries_.max_size();
+-      if (entries_.size() == limit) throw std::length_error("rank envelope full");
+-      const auto grown = entries_.capacity() > limit / 2
+-          ? limit : std::max<std::size_t>(8, entries_.capacity() * 2);
+-      entries_.reserve(std::min(limit, grown));
+-    }
+-    return {index, {value, 1, delta, prefix}};
++    if (count_ >= std::numeric_limits<std::uint32_t>::max() && storage_.index() == 0)
++      promote();
++    return std::visit([&](auto& entries) -> Insertion {
++      const std::size_t index = upper(entries, value);
++      const std::uint64_t previous = index ? entries[index - 1].prefix : 0;
++      const std::uint64_t prefix = previous + 1;
++      const std::uint64_t delta = index && index < entries.size()
++          ? entries[index].prefix - previous + entries[index].delta - 1 : 0;
++      if (entries.size() == entries.capacity()) {
++        const auto limit = entries.max_size();
++        if (entries.size() == limit) throw std::length_error("rank envelope full");
++        const auto spare = std::max<std::size_t>(8, entries.capacity() / 4);
++        entries.reserve(entries.capacity() + std::min(limit - entries.capacity(), spare));
++      }
++      return {index, {value, delta, prefix}};
++    }, storage_);
+   }
+ 
+   void commit_add(Insertion insertion) noexcept {
+-    entries_.insert(entries_.begin() + insertion.index, insertion.entry);
+-    for (std::size_t i = insertion.index + 1; i < entries_.size(); ++i)
+-      ++entries_[i].prefix;
++    std::visit([&](auto& entries) {
++      using Stored = typename std::decay_t<decltype(entries)>::value_type;
++      const Stored inserted = narrow<Stored>(insertion.entry);
++      entries.push_back(inserted);
++      // Move the suffix and shift its integer prefixes in one pass.
++      for (std::size_t i = entries.size() - 1; i > insertion.index; --i) {
++        auto moved = entries[i - 1];
++        ++moved.prefix;
++        entries[i] = moved;
++      }
++      entries[insertion.index] = inserted;
++    }, storage_);
+     ++count_;
+-    compress();
+-  }
+-
+-  Bounds bounds(double value) const noexcept { return before(upper(value)); }
++    // Insertion changes only the pairs adjacent to the inserted tag (and
++    // the old first tag when inserting a new minimum). A threshold increase
++    // can affect all pairs. Skip a full scan only when no deletion is possible.
++    const bool threshold_changed = count_ > capacity_ && count_ % capacity_ == 0;
++    if (threshold_changed) compress();
++    else compress_near(insertion.index);
++  }
++
++  Bounds bounds(double value) const noexcept {
++    return std::visit([&](const auto& entries) {
++      return before(entries, upper(entries, value));
++    }, storage_);
++  }
+   void resize(std::size_t capacity) noexcept {
+     capacity_ = std::min(capacity_, capacity);
+     compress();
+@@ -62,78 +89,137 @@
+       throw std::overflow_error("observation count overflow");
+     RankEnvelope result(std::min(capacity_, other.capacity_));
+     result.count_ = count_ + other.count_;
+-    if (entries_.size() > result.entries_.max_size() - other.entries_.size())
+-      throw std::length_error("rank envelope full");
+-    result.entries_.reserve(entries_.size() + other.entries_.size());
+-    std::size_t a = 0, b = 0;
+-    std::uint64_t previous = 0;
+-    while (a < entries_.size() || b < other.entries_.size()) {
+-      // All A occurrences precede B occurrences at equal values. An A tag
+-      // receives B's strict rank; a B tag receives A's inclusive rank.
+-      const bool take_a = b == other.entries_.size() ||
+-          (a < entries_.size() && entries_[a].value <= other.entries_[b].value);
+-      const Entry& entry = take_a ? entries_[a++] : other.entries_[b++];
+-      const Bounds extra = take_a
+-          ? other.before(other.lower(entry.value)) : bounds(entry.value);
+-      const std::uint64_t minimum = entry.prefix + extra.lower;
+-      const std::uint64_t maximum = entry.prefix + entry.delta + extra.upper;
+-      result.entries_.push_back({entry.value, minimum - previous,
+-                                 maximum - minimum, minimum});
+-      previous = minimum;
+-    }
++    if (result.count_ > std::numeric_limits<std::uint32_t>::max())
++      result.storage_.emplace<1>();
++    std::visit([&](const auto& left, const auto& right, auto& output) {
++      using Stored = typename std::decay_t<decltype(output)>::value_type;
++      const auto limit = output.max_size();
++      if (right.size() > limit || left.size() > limit - right.size())
++        throw std::length_error("rank envelope full");
++      output.reserve(left.size() + right.size());
++      std::size_t a = 0, b = 0;
++      while (a < left.size() || b < right.size()) {
++        // Every A occurrence precedes B occurrences at equal values. The
++        // union cursors locate B's strict rank and A's inclusive rank directly.
++        const bool take_a = b == right.size() ||
++            (a < left.size() && left[a].value <= right[b].value);
++        const Entry tag = take_a ? widen(left[a++]) : widen(right[b++]);
++        const Bounds extra = take_a ? other.before(right, b) : before(left, a);
++        const std::uint64_t minimum = tag.prefix + extra.lower;
++        const std::uint64_t maximum = tag.prefix + tag.delta + extra.upper;
++        output.push_back(narrow<Stored>({tag.value, maximum - minimum, minimum}));
++      }
++    }, storage_, other.storage_, result.storage_);
+     result.compress();
+     return result;
+   }
+ 
+  private:
+-  using Iterator = std::vector<Entry>::const_iterator;
+-  Iterator upper(double value) const noexcept {
+-    return std::upper_bound(entries_.begin(), entries_.end(), value,
+-        [](double key, const Entry& entry) { return key < entry.value; });
+-  }
+-  Iterator lower(double value) const noexcept {
+-    return std::lower_bound(entries_.begin(), entries_.end(), value,
+-        [](const Entry& entry, double key) { return entry.value < key; });
+-  }
+-  Bounds before(Iterator next) const noexcept {
+-    return {next == entries_.begin() ? 0 : (next - 1)->prefix,
+-            next == entries_.end() ? count_ : next->prefix + next->delta - 1};
++  struct SmallEntry { double value; std::uint32_t delta, prefix; };
++  using Storage = std::variant<std::vector<SmallEntry>, std::vector<Entry>>;
++  template<class Stored>
++  static Entry widen(const Stored& entry) noexcept {
++    return {entry.value, entry.delta, entry.prefix};
++  }
++  template<class Stored>
++  static Stored narrow(Entry entry) noexcept {
++    // The selected storage can represent all positions through count_.
++    using Integer = decltype(Stored::prefix);
++    return {entry.value, static_cast<Integer>(entry.delta),
++                         static_cast<Integer>(entry.prefix)};
++  }
++  void promote() {
++    const auto& small = std::get<0>(storage_);
++    std::vector<Entry> wide;
++    wide.reserve(small.capacity());
++    for (const auto& entry : small) wide.push_back(widen(entry));
++    storage_.emplace<1>(std::move(wide));
++  }
++  template<class Entries>
++  static std::size_t upper(const Entries& entries, double value) noexcept {
++    return static_cast<std::size_t>(std::upper_bound(entries.begin(), entries.end(), value,
++        [](double key, const auto& entry) { return key < entry.value; }) - entries.begin());
++  }
++  template<class Entries>
++  Bounds before(const Entries& entries, std::size_t next) const noexcept {
++    return {next == 0 ? 0 : static_cast<std::uint64_t>(entries[next - 1].prefix),
++            next == entries.size() ? count_
++              : static_cast<std::uint64_t>(entries[next].prefix) + entries[next].delta - 1};
++  }
++  void compress_near(std::size_t inserted) noexcept {
++    const auto limit = threshold();
++    std::visit([&](auto& entries) {
++      using Stored = typename std::decay_t<decltype(entries)>::value_type;
++      if (entries.size() < 3) return;
++      const auto end = std::min(inserted + 1, entries.size() - 2);
++      std::size_t write = end + 1, read = end, begin;
++      for (;;) {
++        const auto tag = entries[read];
++        const bool same_previous = read > 0 && entries[read - 1].value == tag.value;
++        const bool same_successor = entries[write].value == tag.value;
++        const std::uint64_t previous = read ? entries[read - 1].prefix : 0;
++        const auto gap = static_cast<std::uint64_t>(entries[write].prefix) - previous;
++        const bool remove = read && same_previous == same_successor &&
++            entries[write].delta <= limit && gap <= limit - entries[write].delta;
++        if (remove) {
++          if (entries[read - 1].value < entries[write].value)
++            uncertainty_ = std::max(uncertainty_, gap + entries[write].delta - 1);
++        } else {
++          entries[--write] = tag;
++        }
++        // Keeping an old tag left of the insertion restores the old successor
++        // of every remaining pair. They were already ineligible for deletion.
++        if ((!remove && read < inserted) || read == 0) {
++          begin = read;
++          break;
++        }
++        --read;
++      }
++      const auto removed = write - begin;
++      if (removed) {
++        std::memmove(entries.data() + begin, entries.data() + write,
++                     (entries.size() - write) * sizeof(Stored));
++        entries.resize(entries.size() - removed);
++      }
++    }, storage_);
+   }
+   void compress() noexcept {
+     const std::uint64_t limit = threshold();
+-    // Compact in one reverse sweep. Keep both extrema. The successor's
+-    // prefix stays unchanged when the preceding gap is absorbed into it.
+-    std::size_t write = entries_.size();
+-    for (std::size_t read = entries_.size(); read > 0;) {
+-      const Entry entry = entries_[--read];
+-      // Keep endpoints of represented duplicate runs. Besides preserving
+-      // exact tie boundaries where available, this prevents needless interval
+-      // widening during repeated merges of duplicate-heavy summaries.
+-      const bool same_previous = read > 0 && entries_[read - 1].value == entry.value;
+-      const bool same_successor = write < entries_.size() && entries_[write].value == entry.value;
+-      const bool tie_boundary = same_previous != same_successor;
+-      if (read != 0 && !tie_boundary && write < entries_.size() &&
+-          entries_[write].gap + entries_[write].delta <= limit &&
+-          entry.gap <= limit - entries_[write].gap - entries_[write].delta) {
+-        entries_[write].gap += entry.gap;
+-      } else {
+-        entries_[--write] = entry;
+-      }
+-    }
+-    const std::size_t size = entries_.size() - write;
+-    for (std::size_t i = 0; i < size; ++i) entries_[i] = entries_[write + i];
+-    entries_.resize(size);
+-    uncertainty_ = 0;
+-    for (std::size_t i = 1; i < entries_.size(); ++i) {
+-      // No value query can fall between equal-valued tags. Only gaps
+-      // between distinct retained values contribute rank uncertainty.
+-      if (entries_[i - 1].value < entries_[i].value)
+-        uncertainty_ = std::max(uncertainty_, entries_[i].gap + entries_[i].delta - 1);
+-    }
++    std::visit([&](auto& entries) {
++      // Keep extrema and duplicate-run endpoints. The surviving prefixes
++      // stay fixed; removed gaps are implicit in their new differences.
++      std::size_t write = entries.size();
++      for (std::size_t read = entries.size(); read > 0;) {
++        const auto tag = entries[--read];
++        const bool same_previous = read > 0 && entries[read - 1].value == tag.value;
++        const bool same_successor = write < entries.size() && entries[write].value == tag.value;
++        const bool tie_boundary = same_previous != same_successor;
++        const std::uint64_t previous = read ? entries[read - 1].prefix : 0;
++        if (read != 0 && !tie_boundary && write < entries.size() &&
++            entries[write].delta <= limit &&
++            entries[write].prefix - previous <= limit - entries[write].delta) {
++          // Absorbed into the successor without changing its prefix or delta.
++        } else {
++          entries[--write] = tag;
++        }
++      }
++      const std::size_t size = entries.size() - write;
++      uncertainty_ = 0;
++      for (std::size_t i = 0; i < size; ++i) {
++        entries[i] = entries[write + i];
++        // No query falls between equal-valued tags. Calculate maximum width
++        // during compaction rather than scanning a third time.
++        if (i && entries[i - 1].value < entries[i].value)
++          uncertainty_ = std::max(uncertainty_,
++              static_cast<std::uint64_t>(entries[i].prefix) - entries[i - 1].prefix
++                + entries[i].delta - 1);
++      }
++      entries.resize(size);
++    }, storage_);
+   }
+   std::size_t capacity_;
+   std::uint64_t count_ = 0, uncertainty_ = 0;
+-  std::vector<Entry> entries_;
++  Storage storage_;
+ };
+ }  // namespace detail
+ 
+@@ -196,8 +282,8 @@
+   double quantile(double q) const {
+     if (!(q >= 0 && q <= 1)) throw std::invalid_argument("q must be in [0, 1]");
+     if (!count()) throw std::logic_error("quantile of empty sketch");
+-    const double minimum = envelope_.entries().front().value;
+-    const double maximum = envelope_.entries().back().value;
++    const double minimum = envelope_.entry(0).value;
++    const double maximum = envelope_.entry(envelope_.size() - 1).value;
+     if (q == 0) return minimum;
+     if (q == 1) return maximum;
+     const long double target = std::ceil(q * static_cast<long double>(count()));

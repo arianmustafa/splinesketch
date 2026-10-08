@@ -1,0 +1,60 @@
+--- a/include/splinesketch/splinesketch.hpp
++++ b/include/splinesketch/splinesketch.hpp
+@@ -34,6 +34,17 @@
+     nodes_.reserve(buckets + 2);
+     pending_.reserve(buckets + 2);
+     heavy_.reserve(buckets);
++  }
++
++  SplineSketch(const SplineSketch&) = default;
++  SplineSketch(SplineSketch&&) noexcept = default;
++  SplineSketch& operator=(SplineSketch&&) noexcept = default;
++  SplineSketch& operator=(const SplineSketch& other) {
++    if (this != &other) {
++      SplineSketch updated(other);
++      *this = std::move(updated);
++    }
++    return *this;
+   }
+ 
+   void add(double value) {
+--- a/include/splinesketch/certified_splinesketch.hpp
++++ b/include/splinesketch/certified_splinesketch.hpp
+@@ -235,6 +235,17 @@
+   explicit CertifiedSplineSketch(std::size_t buckets = 128)
+       : spline_(buckets), envelope_(buckets) {}
+ 
++  CertifiedSplineSketch(const CertifiedSplineSketch&) = default;
++  CertifiedSplineSketch(CertifiedSplineSketch&&) noexcept = default;
++  CertifiedSplineSketch& operator=(CertifiedSplineSketch&&) noexcept = default;
++  CertifiedSplineSketch& operator=(const CertifiedSplineSketch& other) {
++    if (this != &other) {
++      CertifiedSplineSketch updated(other);
++      *this = std::move(updated);
++    }
++    return *this;
++  }
++
+   void add(double value) {
+     if (!std::isfinite(value)) throw std::invalid_argument("value must be finite");
+     if (count() == std::numeric_limits<std::uint64_t>::max())
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -35,6 +35,17 @@
+     nodes_.reserve(capacity_ + 2);
+     buffer_.reserve(5 * capacity_);
+     heavy_.reserve(capacity_);
++  }
++
++  BasicPaperSplineSketch(const BasicPaperSplineSketch&) = default;
++  BasicPaperSplineSketch(BasicPaperSplineSketch&&) noexcept = default;
++  BasicPaperSplineSketch& operator=(BasicPaperSplineSketch&&) noexcept = default;
++  BasicPaperSplineSketch& operator=(const BasicPaperSplineSketch& other) {
++    if (this != &other) {
++      BasicPaperSplineSketch updated(other);
++      *this = std::move(updated);
++    }
++    return *this;
+   }
+ 
+   void add(double value) {

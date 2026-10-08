@@ -1,0 +1,433 @@
+--- a/include/splinesketch/splinesketch.hpp
++++ b/include/splinesketch/splinesketch.hpp
+@@ -19,7 +19,7 @@
+ // inserted values <= x. Heavy hitters are held exactly in a Misra-Gries table.
+ // The implementation follows Sections 3 and 4 of arXiv:2504.01206v3.
+ class SplineSketch {
+-  friend class PaperSplineSketch;
++  template<bool> friend class BasicPaperSplineSketch;
+ #ifdef SPLINESKETCH_TESTING
+   friend struct SplineSketchInvariantInspector;
+ #endif
+@@ -363,7 +363,8 @@
+     if (d1 == 0 || slope > 3 * d0) slope = 3 * d0;
+     return slope;
+   }
+-  static void rebuild(std::vector<Node>& nodes) {
++  template<class Nodes>
++  static void rebuild(Nodes& nodes) {
+     long double sum = 0;
+     for (auto& node : nodes) {
+       sum += node.mass;
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -8,11 +8,18 @@
+ // Section 3 / Appendix B baseline, with Section 4.2's weighted MG batching.
+ // Kept separate from SplineSketch so comparisons retain the old algorithm.
+ // Transition checks are enforced in ordinary builds, not just in tests.
+-class PaperSplineSketch {
++template<bool TrackBounds>
++class BasicPaperSplineSketch {
+ #ifdef SPLINESKETCH_TESTING
+   friend struct PaperSplineSketchInspector;
++  friend struct PaperCertificateInspector;
+ #endif
+-  using Node = SplineSketch::Node;
++  using CoreNode = SplineSketch::Node;
++  struct BoundNode : CoreNode {
++    using CoreNode::CoreNode;
++    std::uint64_t lower = 0, upper = 0, atom = 0;
++  };
++  using Node = std::conditional_t<TrackBounds, BoundNode, CoreNode>;
+   using Heavy = SplineSketch::Heavy;
+   using Item = std::pair<double, std::uint64_t>;
+   static constexpr std::size_t npos = std::numeric_limits<std::size_t>::max();
+@@ -21,7 +28,7 @@
+   // Practical follows Section 4.1's adaptive constant. Theoretical fixes 1024,
+   // exceeding Appendix B's 45/beta for ideal midpoint arithmetic.
+   enum class BoundPolicy { practical, theoretical };
+-  explicit PaperSplineSketch(std::size_t buckets = 128,
++  explicit BasicPaperSplineSketch(std::size_t buckets = 128,
+       BoundPolicy policy = BoundPolicy::practical)
+       : capacity_(checked_capacity(buckets)), epoch_end_(5 * buckets),
+         policy_(policy), factor_(initial_factor()) {
+@@ -41,7 +48,7 @@
+       ++count_;
+       return;
+     }
+-    PaperSplineSketch updated(*this);
++    BasicPaperSplineSketch updated(*this);
+     updated.buffer_.reserve(5 * capacity_);
+     updated.buffer_.push_back(value);
+     ++updated.count_;
+@@ -55,14 +62,84 @@
+   std::size_t heavy_hitter_count() const noexcept { return heavy_.size(); }
+   bool finalized() const noexcept { return finalized_; }
+ 
++  struct RankBounds { std::uint64_t lower, upper; };
++  struct RankEstimate {
++    double estimate;
++    std::uint64_t lower_rank, upper_rank;
++    double max_error;
++  };
++  template<bool Enabled = TrackBounds, std::enable_if_t<Enabled && TrackBounds, int> = 0>
++  RankBounds rank_bounds(double x) const {
++    if (std::isnan(x)) throw std::invalid_argument("query must not be NaN");
++    auto interval = bucket_bounds(nodes_, x);
++    std::uint64_t exact = 0;
++    for (double value : buffer_) if (value <= x) ++exact;
++    for (const auto& item : heavy_) if (item.first <= x) exact += item.second.exact;
++    interval.lower += exact; interval.upper += exact;
++    return interval;
++  }
++  template<bool Enabled = TrackBounds, std::enable_if_t<Enabled && TrackBounds, int> = 0>
++  RankEstimate rank_with_error(double x) const {
++    const auto result = rank_and_bounds(x);
++    const auto interval = result.second;
++    const double estimate = certified_estimate(result.first, interval);
++    const auto error = std::max(integer_distance(estimate, interval.lower),
++                                integer_distance(estimate, interval.upper));
++    return {estimate, interval.lower, interval.upper, error};
++  }
++  // Uniform bound over all returned ranks at the current state. Certificate
++  // uncertainty is an exact integer; the return allowance covers binary64
++  // conversion even above 2^53. No spline monotonicity premise is needed.
++  template<bool Enabled = TrackBounds, std::enable_if_t<Enabled && TrackBounds, int> = 0>
++  std::uint64_t max_rank_uncertainty() const noexcept {
++    std::uint64_t width = 0;
++    for (std::size_t i = 0; i < nodes_.size(); ++i) {
++      width = std::max(width, nodes_[i].upper - nodes_[i].lower);
++      if (i && std::nextafter(nodes_[i - 1].x, INFINITY) < nodes_[i].x)
++        width = std::max(width, nodes_[i].upper - nodes_[i].atom - nodes_[i - 1].lower);
++    }
++    return width;
++  }
++  template<bool Enabled = TrackBounds, std::enable_if_t<Enabled && TrackBounds, int> = 0>
++  double max_rank_error() const noexcept {
++    const auto width = max_rank_uncertainty();
++    if (count_ <= (std::uint64_t{1} << 53)) return outward_integer(width, true);
++    const double rounded_count = static_cast<double>(count_);
++    const double allowance = std::nextafter(rounded_count, INFINITY) - rounded_count;
++    return round_up(outward_integer(width, true) + allowance);
++  }
++
+   double rank(double x) const {
++    if constexpr (TrackBounds) {
++      const auto result = rank_and_bounds(x);
++      return certified_estimate(result.first, result.second);
++    } else return raw_rank(x);
++  }
++
++ private:
++  double raw_rank(double x) const {
+     if (std::isnan(x)) throw std::invalid_argument("query must not be NaN");
+     long double value = spline_rank(nodes_, x);
+     for (double v : buffer_) if (v <= x) value += 1;
+     for (const auto& item : heavy_) if (item.first <= x) value += item.second.exact;
+     return static_cast<double>(std::clamp(value, 0.0L, static_cast<long double>(count_)));
+   }
+-
++  // The certified estimate and integer contribution share one exact-data scan;
++  // floating additions retain precisely the original rank() order.
++  std::pair<double, RankBounds> rank_and_bounds(double x) const {
++    if (std::isnan(x)) throw std::invalid_argument("query must not be NaN");
++    long double value = spline_rank(nodes_, x);
++    std::uint64_t exact = 0;
++    for (double v : buffer_) if (v <= x) { value += 1; ++exact; }
++    for (const auto& item : heavy_) if (item.first <= x) {
++      value += item.second.exact; exact += item.second.exact;
++    }
++    auto interval = bucket_bounds(nodes_, x);
++    interval.lower += exact; interval.upper += exact;
++    return {static_cast<double>(std::clamp(value, 0.0L, static_cast<long double>(count_))), interval};
++  }
++
++ public:
+   double quantile(double q) const {
+     if (!(q >= 0 && q <= 1)) throw std::invalid_argument("q must be in [0, 1]");
+     if (!count_) throw std::logic_error("quantile of empty sketch");
+@@ -94,7 +171,15 @@
+     const auto reaches = [&](double x) {
+       const auto value = spline_rank(nodes_, x) + exact.rank(x);
+       if (std::fabs(value - target) <= slack) return rank(x) >= target;
+-      return static_cast<double>(std::clamp(value, 0.0L, static_cast<long double>(count_))) >= target;
++      const auto estimate = static_cast<double>(std::clamp(value, 0.0L, static_cast<long double>(count_)));
++      if constexpr (TrackBounds) {
++        auto interval = bucket_bounds(nodes_, x);
++        const auto added = exact.integer_rank(x);
++        interval.lower += added; interval.upper += added;
++        const auto certified = certified_estimate(estimate, interval);
++        if (std::fabs(certified - target) <= slack) return rank(x) >= target;
++        return certified >= target;
++      } else return estimate >= target;
+     };
+     while (low < high) {
+       const auto mid = low + (high - low) / 2;
+@@ -106,7 +191,7 @@
+ 
+   void consolidate() {
+     if (buffer_.empty()) return;
+-    PaperSplineSketch updated(*this);
++    BasicPaperSplineSketch updated(*this);
+     updated.buffer_.reserve(5 * capacity_);
+     updated.consolidate_in_place();
+     *this = std::move(updated);
+@@ -116,7 +201,7 @@
+     checked_capacity(buckets);
+     if (finalized_) throw std::logic_error("cannot resize a finalized sketch");
+     if (buckets == capacity_) return;
+-    PaperSplineSketch updated(*this);
++    BasicPaperSplineSketch updated(*this);
+     updated.consolidate_in_place();
+     const auto old = updated.capacity_;
+     const bool reset_protection = (buckets > old ? buckets - old : old - buckets) > old / 4;
+@@ -137,13 +222,13 @@
+     *this = std::move(updated);
+   }
+ 
+-  void merge(const PaperSplineSketch& other) {
++  void merge(const BasicPaperSplineSketch& other) {
+     if (finalized_ || other.finalized_)
+       throw std::logic_error("cannot merge a finalized sketch");
+     if (count_ > std::numeric_limits<std::uint64_t>::max() - other.count_)
+       throw std::overflow_error("observation count overflow");
+     const auto& larger = count_ >= other.count_ ? *this : other;
+-    PaperSplineSketch result(larger.capacity_, larger.policy_);
++    BasicPaperSplineSketch result(larger.capacity_, larger.policy_);
+     result.count_ = count_ + other.count_;
+     result.epoch_end_ = larger.epoch_end_;
+     result.factor_ = std::max(factor_, other.factor_);
+@@ -162,6 +247,11 @@
+     for (auto& node : result.nodes_) {
+       const long double value = spline_rank(nodes_, node.x) + spline_rank(other.nodes_, node.x);
+       node.mass = std::max(0.0L, value - previous);
++      if constexpr (TrackBounds) {
++        const auto left = bucket_bounds(nodes_, node.x), right = bucket_bounds(other.nodes_, node.x);
++        node.lower = left.lower + right.lower; node.upper = left.upper + right.upper;
++        node.atom = bucket_atom(nodes_, node.x) + bucket_atom(other.nodes_, node.x);
++      }
+       previous = value;
+       while (at < larger.nodes_.size() && larger.nodes_[at].x < node.x) ++at;
+       if (at < larger.nodes_.size() && larger.nodes_[at].x == node.x)
+@@ -190,7 +280,7 @@
+   // Section 4.2's final storage reduction. A finalized sketch is query-only.
+   void finalize() {
+     if (finalized_) return;
+-    PaperSplineSketch updated(*this);
++    BasicPaperSplineSketch updated(*this);
+     updated.consolidate_in_place();
+     std::vector<Item> released;
+     for (auto it = updated.heavy_.begin(); it != updated.heavy_.end();) {
+@@ -234,6 +324,23 @@
+       const auto at = static_cast<std::size_t>(it - items.begin());
+       return spline_rank(nodes, x) + (at ? sums[at - 1] : 0);
+     }
++    std::uint64_t integer_rank(double x) const {
++      const auto it = std::upper_bound(items.begin(), items.end(), x,
++          [](double value, const Item& item) { return value < item.first; });
++      const auto at = static_cast<std::size_t>(it - items.begin());
++      return at ? sums[at - 1] : 0;
++    }
++    RankBounds bounds(double x) const {
++      auto interval = bucket_bounds(nodes, x);
++      const auto exact = integer_rank(x);
++      interval.lower += exact; interval.upper += exact;
++      return interval;
++    }
++    std::uint64_t atom(double x) const {
++      const auto it = std::lower_bound(items.begin(), items.end(), x,
++          [](const Item& item, double value) { return item.first < value; });
++      return bucket_atom(nodes, x) + (it != items.end() && it->first == x ? it->second : 0);
++    }
+   };
+   std::size_t capacity_;
+   std::uint64_t count_ = 0, epoch_end_;
+@@ -243,6 +350,71 @@
+   std::vector<Node> nodes_;
+   std::vector<double> buffer_;
+   std::unordered_map<double, Heavy> heavy_;
++
++  static RankBounds bucket_bounds(const std::vector<Node>& nodes, double x) {
++    if constexpr (TrackBounds) {
++      if (nodes.empty() || x < nodes.front().x) return {0, 0};
++      if (x >= nodes.back().x) return {nodes.back().upper, nodes.back().upper};
++      const auto it = std::lower_bound(nodes.begin(), nodes.end(), x,
++          [](const Node& node, double value) { return node.x < value; });
++      if (it->x == x) return {it->lower, it->upper};
++      return {(it - 1)->lower, it->upper - it->atom};
++    } else return {0, 0};
++  }
++  static std::uint64_t bucket_atom(const std::vector<Node>& nodes, double x) {
++    if constexpr (TrackBounds) {
++      const auto it = std::lower_bound(nodes.begin(), nodes.end(), x,
++          [](const Node& node, double value) { return node.x < value; });
++      return it != nodes.end() && it->x == x ? it->atom : 0;
++    } else return 0;
++  }
++  static double outward_integer(std::uint64_t value, bool up) noexcept {
++    const double rounded = static_cast<double>(value);
++    if (value <= (std::uint64_t{1} << 53)) return rounded;
++    return std::nextafter(rounded, up ? INFINITY : -INFINITY);
++  }
++  static double round_up(double value) noexcept {
++    return value == 0 ? 0 : std::nextafter(value, INFINITY);
++  }
++  static double integer_distance(double value, std::uint64_t endpoint) noexcept {
++    // At and above 2^52 every binary64 value is an integer. Compute the
++    // distance in uint64 instead of losing low count bits in a conversion.
++    // The certified estimate is always in [0,2^64]; that final endpoint
++    // needs a separate branch because conversion to uint64 would overflow.
++    if (value >= 0x1p52) {
++      if (value == 0x1p64) {
++        if (!endpoint) return value;
++        return outward_integer(std::numeric_limits<std::uint64_t>::max() - endpoint + 1, true);
++      }
++      const auto integer = static_cast<std::uint64_t>(value);
++      return outward_integer(integer >= endpoint ? integer - endpoint : endpoint - integer, true);
++    }
++    return round_up(std::max(std::fabs(value - outward_integer(endpoint, false)),
++                             std::fabs(outward_integer(endpoint, true) - value)));
++  }
++  static double certified_estimate(double value, RankBounds interval) noexcept {
++    if (!std::isfinite(value))
++      value = static_cast<double>(interval.lower + (interval.upper - interval.lower) / 2);
++    return std::clamp(value, static_cast<double>(interval.lower), static_cast<double>(interval.upper));
++  }
++  // Reuse the ordered reestimation cursors instead of searching each key.
++  static void set_bounds(Node& node, const Snapshot& before, std::size_t old, std::size_t pending) {
++    if constexpr (TrackBounds) {
++      RankBounds interval;
++      std::uint64_t atom = 0;
++      if (old < before.nodes.size() && before.nodes[old].x == node.x) {
++        interval = {before.nodes[old].lower, before.nodes[old].upper};
++        atom = before.nodes[old].atom;
++      } else if (old == 0) interval = {0, 0};
++      else if (old == before.nodes.size())
++        interval = {before.nodes.back().upper, before.nodes.back().upper};
++      else interval = {before.nodes[old - 1].lower, before.nodes[old].upper - before.nodes[old].atom};
++      const auto added = pending ? before.sums[pending - 1] : 0;
++      node.lower = interval.lower + added; node.upper = interval.upper + added;
++      node.atom = atom + (pending && before.items[pending - 1].first == node.x
++                         ? before.items[pending - 1].second : 0);
++    }
++  }
+ 
+   static std::size_t checked_capacity(std::size_t k) {
+     if (k < 6 || k > std::numeric_limits<std::size_t>::max() / 10)
+@@ -371,7 +543,11 @@
+       const auto total = before.sums.back();
+       for (std::size_t i = 0; i < capacity_; ++i) {
+         const long double position = static_cast<long double>(i) * (total - 1) / (capacity_ - 1);
+-        const auto offset = static_cast<std::uint64_t>(std::floor(position + 0.5L));
++        const auto rounded = std::floor(position + 0.5L);
++        // In binary64 arithmetic a UINT64_MAX-sized position can round to
++        // 2^64. Clamp before the integer conversion, and retain the maximum.
++        const auto offset = rounded >= static_cast<long double>(total - 1)
++            ? total - 1 : static_cast<std::uint64_t>(rounded);
+         const auto at = std::upper_bound(before.sums.begin(), before.sums.end(), offset);
+         const auto index = static_cast<std::size_t>(at - before.sums.begin());
+         if (nodes_.empty() || nodes_.back().x != before.items[index].first)
+@@ -387,6 +563,13 @@
+       reestimate(before);
+     }
+     rebuild_prefixes();
++    if constexpr (TrackBounds) {
++      std::size_t pending = 0;
++      for (auto& node : nodes_) {
++        while (pending < before.items.size() && before.items[pending].first <= node.x) ++pending;
++        set_bounds(node, before, 0, pending);
++      }
++    }
+     // Complete initialization with exact buffer ranks. These thresholds are
+     // initial selections, so they carry no split-history protection.
+     while (nodes_.size() < capacity_) {
+@@ -412,6 +595,7 @@
+           ? before.nodes[old].prefix : spline_rank(before.nodes, node.x);
+       const long double value = old_rank + (pending ? before.sums[pending - 1] : 0);
+       node.mass = std::max(0.0L, value - previous);
++      set_bounds(node, before, old, pending);
+       previous = value;
+     }
+     rebuild_prefixes();
+@@ -518,7 +702,7 @@
+     for (std::size_t i = 1; i + 1 < nodes_.size(); ++i) {
+       if (nodes_[i].protected_threshold || !(nodes_[i].mass + nodes_[i + 1].mass <= limit)) continue;
+       ++result.count;
+-      const JoinCandidates::Candidate candidate{heuristic(i, true), i};
++      const typename JoinCandidates::Candidate candidate{heuristic(i, true), i};
+       for (std::size_t j = 0; j < result.best.size(); ++j)
+         if (result.best[j].second == npos || candidate < result.best[j]) {
+           for (std::size_t at = result.best.size() - 1; at > j; --at) result.best[at] = result.best[at - 1];
+@@ -551,6 +735,11 @@
+     const auto left = nodes_[i - 1].prefix, right = nodes_[i].prefix;
+     const long double value = std::clamp(before.rank(mid), left, right);
+     nodes_.insert(nodes_.begin() + static_cast<std::ptrdiff_t>(i), Node{mid, value - left, 0, 0, true});
++    if constexpr (TrackBounds) {
++      const auto interval = before.bounds(mid);
++      nodes_[i].lower = interval.lower; nodes_[i].upper = interval.upper;
++      nodes_[i].atom = before.atom(mid);
++    }
+     nodes_[i + 1].mass = right - value;
+     nodes_[i - 1].protected_threshold = nodes_[i + 1].protected_threshold = true;
+     rebuild_prefixes();
+@@ -643,7 +832,7 @@
+         return result;
+       }
+     };
+-    PaperSplineSketch& sketch;
++    BasicPaperSplineSketch& sketch;
+     const Snapshot* before;
+     std::vector<Links> links;
+     std::vector<Id> dirty;
+@@ -652,7 +841,7 @@
+     std::size_t size;
+     bool growing;
+ 
+-    HeapRebalance(PaperSplineSketch& s, const Snapshot& snapshot, bool grow)
++    HeapRebalance(BasicPaperSplineSketch& s, const Snapshot& snapshot, bool grow)
+         : sketch(s), before(&snapshot), tail(static_cast<Id>(s.nodes_.size() - 1)),
+           size(s.nodes_.size()), growing(grow && size < s.capacity_) {
+       const auto slots = std::max(size, s.capacity_) + 2;
+@@ -765,6 +954,11 @@
+         links.emplace_back(); sketch.nodes_.emplace_back(mid);
+       }
+       sketch.nodes_[id] = Node{mid, value - low, 0, 0, true};
++      if constexpr (TrackBounds) {
++        const auto interval = before->bounds(mid);
++        sketch.nodes_[id].lower = interval.lower; sketch.nodes_[id].upper = interval.upper;
++        sketch.nodes_[id].atom = before->atom(mid);
++      }
+       sketch.nodes_[right].mass = high - value;
+       sketch.nodes_[left].protected_threshold = sketch.nodes_[right].protected_threshold = true;
+       links[id] = Links{}; links[id].prev = left; links[id].next = right;
+@@ -866,6 +1060,7 @@
+             ? snapshot.nodes[old].prefix : spline_rank(snapshot.nodes, x);
+         const long double value = old_rank + (pending ? snapshot.sums[pending - 1] : 0);
+         const long double mass = std::max(0.0L, value - previous);
++        set_bounds(sketch.nodes_[id], snapshot, old, pending);
+         if (mass != sketch.nodes_[id].mass) {
+           mark_neighbours(id);
+           sketch.nodes_[id].mass = mass;
+@@ -882,6 +1077,10 @@
+       for (Id id = head; id != none; id = links[id].next) {
+         const auto& node = sketch.nodes_[id];
+         result.emplace_back(node.x, node.mass, 0, 0, node.protected_threshold);
++        if constexpr (TrackBounds) {
++          result.back().lower = node.lower; result.back().upper = node.upper;
++          result.back().atom = node.atom;
++        }
+       }
+       rebuild(result);
+       return result;
+@@ -1056,6 +1255,11 @@
+   }
+ };
+ 
++using PaperSplineSketch = BasicPaperSplineSketch<false>;
++using CertifiedPaperSplineSketch = BasicPaperSplineSketch<true>;
++
++static_assert(std::is_nothrow_move_assignable<CertifiedPaperSplineSketch>::value,
++              "certified paper sketch commits must not throw");
+ static_assert(std::is_nothrow_move_assignable<PaperSplineSketch>::value,
+               "PaperSplineSketch commits must not throw");
+ 

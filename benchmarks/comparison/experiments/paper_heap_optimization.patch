@@ -1,0 +1,466 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -422,6 +422,12 @@
+     all.prepare();
+     if (nodes_.empty()) {
+       initialize(all);
++      return;
++    }
++    // Keep stable slots and heaps across all proof-required batches. Rebuilding
++    // them for every small batch costs more than the scans they replace.
++    if (use_heap_backend()) {
++      incorporate_heaps(all);
+       return;
+     }
+     // Appendix B bounds batch *occurrences*, not the number of distinct keys.
+@@ -553,10 +559,450 @@
+     long double sum = 0;
+     for (auto& node : nodes_) { sum += node.mass; node.prefix = sum; }
+   }
++  // Transient stable slots: nodes_ is repurposed while this private checked
++  // copy is being consolidated. Its prefix/slope fields cache heap scores;
++  // the frozen Snapshot remains the only interpolation source until finish().
++  struct HeapRebalance {
++    using Id = std::uint32_t;
++    static constexpr Id none = std::numeric_limits<Id>::max();
++    enum Kind : unsigned { mass_heap, split_heap, join_heap };
++    struct Links {
++      Id prev = none, next = none;
++      std::array<Id, 3> position{{none, none, none}};
++      bool dirty = false;
++    };
++    struct Heap {
++      HeapRebalance& state;
++      Kind kind;
++      std::vector<Id> entries;
++      long double key(Id id) const {
++        const auto& node = state.sketch.nodes_[id];
++        return kind == mass_heap ? node.mass : kind == split_heap ? node.prefix : node.slope;
++      }
++      bool better(Id a, Id b) const {
++        const auto x = key(a), y = key(b);
++        if (x != y) return kind == join_heap ? x < y : x > y;
++        return state.sketch.nodes_[a].x < state.sketch.nodes_[b].x;
++      }
++      void exchange(std::size_t a, std::size_t b) {
++        std::swap(entries[a], entries[b]);
++        state.links[entries[a]].position[kind] = static_cast<Id>(a);
++        state.links[entries[b]].position[kind] = static_cast<Id>(b);
++      }
++      std::size_t up(std::size_t at) {
++        while (at && better(entries[at], entries[(at - 1) / 2])) {
++          const auto parent = (at - 1) / 2;
++          exchange(at, parent); at = parent;
++        }
++        return at;
++      }
++      void down(std::size_t at) {
++        for (;;) {
++          auto child = 2 * at + 1;
++          if (child >= entries.size()) return;
++          if (child + 1 < entries.size() && better(entries[child + 1], entries[child])) ++child;
++          if (!better(entries[child], entries[at])) return;
++          exchange(at, child); at = child;
++        }
++      }
++      void erase(Id id) {
++        const auto at = state.links[id].position[kind];
++        if (at == none) return;
++        exchange(at, entries.size() - 1);
++        entries.pop_back();
++        state.links[id].position[kind] = none;
++        if (at < entries.size()) down(up(at));
++      }
++      void insert(Id id) {
++        state.links[id].position[kind] = static_cast<Id>(entries.size());
++        entries.push_back(id);
++        up(entries.size() - 1);
++      }
++      void build() {
++        for (std::size_t i = 0; i < entries.size(); ++i)
++          state.links[entries[i]].position[kind] = static_cast<Id>(i);
++        for (std::size_t i = entries.size() / 2; i; --i) down(i - 1);
++      }
++      Id top() const { return entries.empty() ? none : entries.front(); }
++      std::array<Id, 3> first_three() const {
++        std::array<Id, 3> result{{none, none, none}};
++        if (entries.empty()) return result;
++        std::array<std::size_t, 4> frontier{{0, 0, 0, 0}};
++        std::size_t count = 1;
++        for (std::size_t i = 0; i < result.size() && count; ++i) {
++          std::size_t best = 0;
++          for (std::size_t j = 1; j < count; ++j)
++            if (better(entries[frontier[j]], entries[frontier[best]])) best = j;
++          const auto at = frontier[best];
++          result[i] = entries[at];
++          frontier[best] = frontier[--count];
++          if (i + 1 == result.size()) break;
++          if (2 * at + 1 < entries.size()) frontier[count++] = 2 * at + 1;
++          if (2 * at + 2 < entries.size()) frontier[count++] = 2 * at + 2;
++        }
++        return result;
++      }
++    };
++    PaperSplineSketch& sketch;
++    const Snapshot* before;
++    std::vector<Links> links;
++    std::vector<Id> dirty;
++    Heap masses{*this, mass_heap, {}}, splits{*this, split_heap, {}}, joins{*this, join_heap, {}};
++    Id head = 0, tail, free = none;
++    std::size_t size;
++    bool growing;
++
++    HeapRebalance(PaperSplineSketch& s, const Snapshot& snapshot, bool grow)
++        : sketch(s), before(&snapshot), tail(static_cast<Id>(s.nodes_.size() - 1)),
++          size(s.nodes_.size()), growing(grow && size < s.capacity_) {
++      const auto slots = std::max(size, s.capacity_) + 2;
++      links.reserve(slots);
++      links.resize(size);
++      dirty.reserve(slots);
++      masses.entries.reserve(slots); splits.entries.reserve(slots); joins.entries.reserve(slots);
++      sketch.nodes_.reserve(slots);
++      for (std::size_t i = 0; i < size; ++i) {
++        links[i].prev = i ? static_cast<Id>(i - 1) : none;
++        links[i].next = i + 1 < size ? static_cast<Id>(i + 1) : none;
++      }
++      for (Id id = head; id != none; id = links[id].next) cache(id);
++      rebuild_heaps();
++      verify();
++    }
++    HeapRebalance(const HeapRebalance&) = delete;
++    HeapRebalance& operator=(const HeapRebalance&) = delete;
++    bool active(Id id) const { return id != none && links[id].prev != id; }
++    bool splittable(Id id) const {
++      const auto left = links[id].prev;
++      if (left == none) return false;
++      const auto mid = midpoint(sketch.nodes_[left].x, sketch.nodes_[id].x);
++      return mid > sketch.nodes_[left].x && mid < sketch.nodes_[id].x;
++    }
++    long double score(Id id, bool joined) const {
++      const auto left = links[id].prev;
++      const auto right = joined ? links[id].next : id;
++      const auto previous = links[left].prev, next = links[right].next;
++      const auto& nodes = sketch.nodes_;
++      const long double h = static_cast<long double>(nodes[right].x) - nodes[left].x;
++      const long double hp = previous != none ? static_cast<long double>(nodes[left].x) - nodes[previous].x : h;
++      const long double hn = next != none ? static_cast<long double>(nodes[next].x) - nodes[right].x : h;
++      const long double mass = nodes[id].mass + (joined ? nodes[right].mass : 0);
++      const long double following = next != none ? nodes[next].mass : 0;
++      const long double value = std::max(std::fabs(mass / h - nodes[left].mass / hp) / (h + hp),
++          std::fabs(following / hn - mass / h) / (h + hn)) * h * h;
++      return std::isfinite(value) ? value : std::numeric_limits<long double>::max();
++    }
++    bool heuristic_eligible(Id id) const {
++      return splittable(id) && sketch.nodes_[id].mass >
++          (growing ? 0 : 2 * static_cast<long double>(sketch.count_) / sketch.capacity_);
++    }
++    bool join_eligible(Id id) const {
++      return links[id].prev != none && links[id].next != none &&
++          !sketch.nodes_[id].protected_threshold && sketch.nodes_[id].mass +
++          sketch.nodes_[links[id].next].mass <= 0.75L * sketch.bound();
++    }
++    void cache(Id id) {
++      auto& node = sketch.nodes_[id];
++      node.prefix = links[id].prev == none ? 0 : score(id, false);
++      node.slope = links[id].prev == none || links[id].next == none ? 0 : score(id, true);
++    }
++    void rebuild_heaps() {
++      masses.entries.clear(); splits.entries.clear(); joins.entries.clear();
++      for (Id id = head; id != none; id = links[id].next) {
++        links[id].position = {{none, none, none}};
++        if (splittable(id) && sketch.nodes_[id].mass > 0) masses.entries.push_back(id);
++        if (heuristic_eligible(id)) splits.entries.push_back(id);
++        if (join_eligible(id)) joins.entries.push_back(id);
++      }
++      masses.build(); splits.build(); joins.build();
++    }
++    void refresh(Id id) {
++      if (!active(id)) return;
++      cache(id);
++      if (splittable(id) && sketch.nodes_[id].mass > 0) masses.insert(id);
++      if (heuristic_eligible(id)) splits.insert(id);
++      if (join_eligible(id)) joins.insert(id);
++    }
++    std::array<Id, 7> detach_neighbours(Id center) {
++      std::array<Id, 7> affected{{none, none, none, none, none, none, none}};
++      auto at = center;
++      for (unsigned i = 0; i < 2 && links[at].prev != none; ++i) at = links[at].prev;
++      for (auto& id : affected) {
++        if (at == none) break;
++        id = at; at = links[at].next;
++        masses.erase(id); splits.erase(id); joins.erase(id);
++      }
++      return affected;
++    }
++    void join(Id id) {
++      if (!join_eligible(id)) throw std::logic_error("illegal paper heap join");
++      const auto affected = detach_neighbours(id);
++      const auto left = links[id].prev, right = links[id].next;
++      sketch.nodes_[right].mass += sketch.nodes_[id].mass;
++      links[left].next = right; links[right].prev = left;
++      links[id].prev = id; links[id].next = free; free = id;
++      --size;
++      for (Id changed : affected) refresh(changed);
++    }
++    void split(Id right) {
++      if (!splittable(right)) throw std::logic_error("unsplittable paper heap bucket");
++      const auto left = links[right].prev;
++      const auto mid = midpoint(sketch.nodes_[left].x, sketch.nodes_[right].x);
++      // Ordered summation deliberately matches the scanning implementation.
++      // An associative tree would change floating-point inverse boundaries.
++      long double low = 0, high = 0;
++      for (Id at = head; at != none; at = links[at].next) {
++        high += sketch.nodes_[at].mass;
++        if (at == left) low = high;
++        if (at == right) break;
++      }
++      const auto value = std::clamp(before->rank(mid), low, high);
++      const auto affected = detach_neighbours(right);
++      Id id;
++      if (free != none) { id = free; free = links[id].next; }
++      else {
++        id = static_cast<Id>(links.size());
++        links.emplace_back(); sketch.nodes_.emplace_back(mid);
++      }
++      sketch.nodes_[id] = Node{mid, value - low, 0, 0, true};
++      sketch.nodes_[right].mass = high - value;
++      sketch.nodes_[left].protected_threshold = sketch.nodes_[right].protected_threshold = true;
++      links[id] = Links{}; links[id].prev = left; links[id].next = right;
++      links[left].next = id; links[right].prev = id;
++      ++size;
++      for (Id changed : affected) refresh(changed);
++      refresh(id);
++      if (growing && size == sketch.capacity_) { growing = false; rebuild_heaps(); }
++    }
++    bool overlaps(Id join_id, Id split_id) const {
++      return join_id == split_id || links[join_id].next == split_id;
++    }
++    Id compatible(const std::array<Id, 3>& candidates, Id split_id) const {
++      for (Id id : candidates) if (id != none && !overlaps(id, split_id)) return id;
++      return none;
++    }
++    void raise() {
++      if (sketch.policy_ == BoundPolicy::theoretical)
++        throw std::logic_error("paper baseline cannot find a legal join");
++      bool unprotected = false;
++      for (Id id = head; id != none; id = links[id].next)
++        if (links[id].prev != none && links[id].next != none)
++          unprotected |= !sketch.nodes_[id].protected_threshold;
++      if (!unprotected) throw std::logic_error("paper baseline has no unprotected join threshold");
++      sketch.factor_ *= 2;
++      rebuild_heaps();
++    }
++    void consider(Id split_id, Id join_id, long double& gain, Id& split, Id& joined) const {
++      if (join_id == none) return;
++      const auto value = sketch.nodes_[split_id].prefix - 1.5L * sketch.nodes_[join_id].slope;
++      if (value > gain || (value == gain && value > 0 &&
++          (split == none || sketch.nodes_[split_id].x < sketch.nodes_[split].x))) {
++        gain = value; split = split_id; joined = join_id;
++      }
++    }
++    void tied_gains(std::size_t at, Id cheapest, long double cost, long double& gain,
++                    Id& split, Id& joined) const {
++      if (at >= splits.entries.size()) return;
++      const auto id = splits.entries[at];
++      const auto value = sketch.nodes_[id].prefix - cost;
++      if (value < gain) return; // all descendants have no larger heuristic
++      if (!overlaps(cheapest, id)) consider(id, cheapest, gain, split, joined);
++      tied_gains(2 * at + 1, cheapest, cost, gain, split, joined);
++      tied_gains(2 * at + 2, cheapest, cost, gain, split, joined);
++    }
++    void best_gain(const std::array<Id, 3>& candidates, Id& split, Id& joined) const {
++      const auto cheapest = candidates[0];
++      long double gain = 0;
++      for (Id id : splits.first_three())
++        if (id != none && !overlaps(cheapest, id)) {
++          consider(id, cheapest, gain, split, joined);
++          break;
++        }
++      if (gain > 0) tied_gains(0, cheapest, 1.5L * sketch.nodes_[cheapest].slope, gain, split, joined);
++      // Only the two splits touching the cheapest join need a different join.
++      for (Id id : {cheapest, links[cheapest].next})
++        if (links[id].position[split_heap] != none) consider(id, compatible(candidates, id), gain, split, joined);
++    }
++    void mark(Id id) {
++      if (!active(id) || links[id].dirty) return;
++      masses.erase(id); splits.erase(id); joins.erase(id);
++      links[id].dirty = true; dirty.push_back(id);
++    }
++    void mark_neighbours(Id center) {
++      auto at = center;
++      for (unsigned i = 0; i < 2 && links[at].prev != none; ++i) at = links[at].prev;
++      for (unsigned i = 0; i < 7 && at != none; ++i) {
++        mark(at); at = links[at].next;
++      }
++    }
++    Id new_slot(double x) {
++      Id id;
++      if (free != none) { id = free; free = links[id].next; }
++      else { id = static_cast<Id>(links.size()); links.emplace_back(); sketch.nodes_.emplace_back(x); }
++      sketch.nodes_[id] = Node{x}; links[id] = Links{};
++      return id;
++    }
++    void reestimate(const Snapshot& snapshot) {
++      before = &snapshot;
++      if (snapshot.items.front().first < sketch.nodes_[head].x) {
++        mark_neighbours(head);
++        const auto id = new_slot(snapshot.items.front().first);
++        links[id].next = head; links[head].prev = id; head = id; ++size;
++        mark(id);
++      }
++      if (snapshot.items.back().first > sketch.nodes_[tail].x) {
++        mark_neighbours(tail);
++        const auto id = new_slot(snapshot.items.back().first);
++        links[id].prev = tail; links[tail].next = id; tail = id; ++size;
++        mark(id);
++      }
++      std::size_t old = 0, pending = 0;
++      long double previous = 0;
++      for (Id id = head; id != none; id = links[id].next) {
++        const auto x = sketch.nodes_[id].x;
++        while (old < snapshot.nodes.size() && snapshot.nodes[old].x < x) ++old;
++        while (pending < snapshot.items.size() && snapshot.items[pending].first <= x) ++pending;
++        const long double old_rank = old < snapshot.nodes.size() && snapshot.nodes[old].x == x
++            ? snapshot.nodes[old].prefix : spline_rank(snapshot.nodes, x);
++        const long double value = old_rank + (pending ? snapshot.sums[pending - 1] : 0);
++        const long double mass = std::max(0.0L, value - previous);
++        if (mass != sketch.nodes_[id].mass) {
++          mark_neighbours(id);
++          sketch.nodes_[id].mass = mass;
++        }
++        previous = value;
++      }
++      for (Id id : dirty) { links[id].dirty = false; refresh(id); }
++      dirty.clear();
++      verify();
++    }
++    std::vector<Node> snapshot_nodes() const {
++      std::vector<Node> result;
++      result.reserve(size);
++      for (Id id = head; id != none; id = links[id].next) {
++        const auto& node = sketch.nodes_[id];
++        result.emplace_back(node.x, node.mass, 0, 0, node.protected_threshold);
++      }
++      rebuild(result);
++      return result;
++    }
++    void finish() {
++      auto& order = masses.entries;
++      order.clear();
++      for (Id id = head; id != none; id = links[id].next) order.push_back(id);
++      // Reuse links as a permutation map; no second Node array is allocated.
++      for (std::size_t i = 0; i < links.size(); ++i) {
++        links[i].position[0] = links[i].prev = static_cast<Id>(i);
++      }
++      for (std::size_t i = 0; i < order.size(); ++i) {
++        const auto wanted = order[i], at = links[wanted].position[0], occupant = links[i].prev;
++        std::swap(sketch.nodes_[i], sketch.nodes_[at]);
++        std::swap(links[i].prev, links[at].prev);
++        links[wanted].position[0] = static_cast<Id>(i);
++        links[occupant].position[0] = at;
++      }
++      sketch.nodes_.resize(size);
++      rebuild(sketch.nodes_);
++    }
++    void verify() const {
++#ifdef SPLINESKETCH_VERIFY_PAPER_HEAPS
++      const auto require = [](bool valid) {
++        if (!valid) throw std::logic_error("paper heap invariant failed");
++      };
++      std::size_t live = 0;
++      Id previous = none;
++      for (Id id = head; id != none; id = links[id].next) {
++        require(id < links.size() && active(id) && links[id].prev == previous && !links[id].dirty);
++        require(++live <= links.size());
++        const auto& node = sketch.nodes_[id];
++        require(std::isfinite(node.mass) && node.mass >= 0);
++        if (previous != none) require(sketch.nodes_[previous].x < node.x);
++        require(node.prefix == (previous == none ? 0 : score(id, false)));
++        require(node.slope == (previous == none || links[id].next == none ? 0 : score(id, true)));
++        require((links[id].position[mass_heap] != none) == (splittable(id) && node.mass > 0));
++        require((links[id].position[split_heap] != none) == heuristic_eligible(id));
++        require((links[id].position[join_heap] != none) == join_eligible(id));
++        previous = id;
++      }
++      require(live == size && previous == tail);
++      for (const auto* heap : {&masses, &splits, &joins}) {
++        for (std::size_t i = 0; i < heap->entries.size(); ++i) {
++          const auto id = heap->entries[i];
++          require(id < links.size() && active(id) && links[id].position[heap->kind] == i);
++          if (i) require(!heap->better(id, heap->entries[(i - 1) / 2]));
++        }
++      }
++#endif
++    }
++    void run(bool materialize = true) {
++      while (size > sketch.capacity_) {
++        if (joins.top() == none) { raise(); continue; }
++        join(joins.top());
++        verify();
++      }
++      for (;;) {
++        auto split_id = masses.top();
++        const bool mandatory = split_id != none && sketch.nodes_[split_id].mass > sketch.bound();
++        Id join_id = none;
++        const auto candidates = joins.first_three();
++        if (!mandatory) {
++          split_id = none;
++          if (growing) split_id = splits.top();
++          else if (size == sketch.capacity_ && joins.entries.size() >= (sketch.capacity_ + 2) / 3 + 2)
++            best_gain(candidates, split_id, join_id);
++        }
++        if (split_id == none) break;
++        if (size < sketch.capacity_) { split(split_id); verify(); continue; }
++        if (join_id == none) join_id = compatible(candidates, split_id);
++        if (join_id == none) { raise(); continue; }
++        join(join_id); split(split_id);
++        verify();
++      }
++      verify();
++      if (materialize) finish();
++    }
++  };
++  void incorporate_heaps(const Snapshot& all) {
++    const auto batch_limit = occurrence_batch_limit();
++    Snapshot batch{nodes_, {}, {}};
++    HeapRebalance state(*this, batch, false);
++    std::size_t at = 0;
++    std::uint64_t used = 0;
++    bool first = true;
++    while (at < all.items.size()) {
++      if (!first) batch.nodes = state.snapshot_nodes();
++      first = false;
++      batch.items.clear(); batch.sums.clear();
++      std::uint64_t size = 0;
++      while (at < all.items.size() && size < batch_limit) {
++        const auto take = std::min(all.items[at].second - used, batch_limit - size);
++        batch.items.emplace_back(all.items[at].first, take);
++        size += take; used += take;
++        if (used == all.items[at].second) { ++at; used = 0; }
++      }
++      batch.prepare();
++      state.reestimate(batch);
++      state.run(false);
++    }
++    state.finish();
++  }
++  bool use_heap_backend() const {
++    if (std::max(capacity_, nodes_.size()) >= HeapRebalance::none - 2) return false;
++#ifdef SPLINESKETCH_PAPER_FORCE_HEAPS
++    return true;
++#else
++    // At smaller capacities the simpler scans beat heap bookkeeping locally.
++    return capacity_ >= 512 || nodes_.size() >= 512;
++#endif
++  }
+   void rebalance(const Snapshot& snapshot, bool supplied, bool growing = false) {
+     if (nodes_.empty()) return;
+     const Snapshot local{supplied ? std::vector<Node>{} : nodes_, {}, {}};
+     const Snapshot& before = supplied ? snapshot : local;
++    if (use_heap_backend()) {
++      HeapRebalance(*this, before, growing).run();
++      return;
++    }
+     // Merge/resize/new extrema reduction: every join still obeys Definition 1.
+     while (nodes_.size() > capacity_) {
+       const auto joins = join_candidates();

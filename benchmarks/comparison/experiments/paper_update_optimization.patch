@@ -1,0 +1,169 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "splinesketch.hpp"
++#include <array>
+ 
+ namespace splinesketch {
+ 
+@@ -224,6 +225,7 @@
+       }
+       items.resize(out);
+       std::uint64_t sum = 0;
++      sums.reserve(items.size());
+       for (auto item : items) { sum += item.second; sums.push_back(sum); }
+     }
+     long double rank(double x) const {
+@@ -384,7 +386,7 @@
+       }
+       reestimate(before);
+     }
+-    rebuild(nodes_);
++    rebuild_prefixes();
+     // Complete initialization with exact buffer ranks. These thresholds are
+     // initial selections, so they carry no split-history protection.
+     while (nodes_.size() < capacity_) {
+@@ -397,6 +399,7 @@
+       if (split == npos) break;
+       split_at(split, before);
+     }
++    rebuild(nodes_);
+     clear_protection();
+   }
+   void reestimate(const Snapshot& before) {
+@@ -411,7 +414,7 @@
+       node.mass = std::max(0.0L, value - previous);
+       previous = value;
+     }
+-    rebuild(nodes_);
++    rebuild_prefixes();
+   }
+   void incorporate(std::vector<Item>& released) {
+     if (released.empty()) return;
+@@ -492,12 +495,33 @@
+     // candidate legality never depends on this optional heuristic.
+     return std::isfinite(value) ? value : std::numeric_limits<long double>::max();
+   }
+-  std::vector<std::pair<long double, std::size_t>> join_candidates() const {
+-    std::vector<std::pair<long double, std::size_t>> result;
+-    for (std::size_t i = 1; i + 1 < nodes_.size(); ++i)
+-      if (!nodes_[i].protected_threshold && nodes_[i].mass + nodes_[i + 1].mass <= 0.75L * bound())
+-        result.emplace_back(heuristic(i, true), i);
+-    std::sort(result.begin(), result.end());
++  struct JoinCandidates {
++    using Candidate = std::pair<long double, std::size_t>;
++    std::array<Candidate, 3> best{{{0, npos}, {0, npos}, {0, npos}}};
++    std::size_t count = 0;
++    std::size_t nonoverlapping(std::size_t split) const {
++      for (const auto& candidate : best)
++        if (candidate.second != npos && candidate.second != split && candidate.second + 1 != split)
++          return candidate.second;
++      return npos;
++    }
++  };
++  JoinCandidates join_candidates() const {
++    JoinCandidates result;
++    const auto limit = 0.75L * bound();
++    for (std::size_t i = 1; i + 1 < nodes_.size(); ++i) {
++      if (nodes_[i].protected_threshold || !(nodes_[i].mass + nodes_[i + 1].mass <= limit)) continue;
++      ++result.count;
++      const JoinCandidates::Candidate candidate{heuristic(i, true), i};
++      for (std::size_t j = 0; j < result.best.size(); ++j)
++        if (result.best[j].second == npos || candidate < result.best[j]) {
++          for (std::size_t at = result.best.size() - 1; at > j; --at) result.best[at] = result.best[at - 1];
++          result.best[j] = candidate;
++          break;
++        }
++    }
++    // A split excludes only the two adjacent join pairs. The cheapest three
++    // therefore contain exactly the first legal non-overlapping sorted join.
+     return result;
+   }
+   void raise_bound() {
+@@ -514,7 +538,7 @@
+       throw std::logic_error("illegal paper join");
+     nodes_[i + 1].mass += nodes_[i].mass;
+     nodes_.erase(nodes_.begin() + static_cast<std::ptrdiff_t>(i));
+-    rebuild(nodes_);
++    rebuild_prefixes();
+   }
+   void split_at(std::size_t i, const Snapshot& before) {
+     const auto mid = midpoint(nodes_[i - 1].x, nodes_[i].x);
+@@ -523,29 +547,33 @@
+     nodes_.insert(nodes_.begin() + static_cast<std::ptrdiff_t>(i), Node{mid, value - left, 0, 0, true});
+     nodes_[i + 1].mass = right - value;
+     nodes_[i - 1].protected_threshold = nodes_[i + 1].protected_threshold = true;
+-    rebuild(nodes_);
++    rebuild_prefixes();
++  }
++  void rebuild_prefixes() {
++    long double sum = 0;
++    for (auto& node : nodes_) { sum += node.mass; node.prefix = sum; }
+   }
+   void rebalance(const Snapshot& snapshot, bool supplied, bool growing = false) {
+     if (nodes_.empty()) return;
+-    const Snapshot local{nodes_, {}, {}};
++    const Snapshot local{supplied ? std::vector<Node>{} : nodes_, {}, {}};
+     const Snapshot& before = supplied ? snapshot : local;
+     // Merge/resize/new extrema reduction: every join still obeys Definition 1.
+     while (nodes_.size() > capacity_) {
+       const auto joins = join_candidates();
+-      if (joins.empty()) { raise_bound(); continue; }
+-      join_at(joins.front().second);
++      if (!joins.count) { raise_bound(); continue; }
++      join_at(joins.best.front().second);
+     }
+     for (;;) {
+       std::size_t split = npos;
+       long double score = -1;
+       bool mandatory = false;
+       for (std::size_t i = 1; i < nodes_.size(); ++i) {
+-        if (!can_split(i) || nodes_[i].mass <= bound()) continue;
++        if (nodes_[i].mass <= bound() || !can_split(i)) continue;
+         if (nodes_[i].mass > score) { split = i; score = nodes_[i].mass; }
+       }
+       mandatory = split != npos;
+       const auto joins = nodes_.size() >= capacity_ ? join_candidates() :
+-          std::vector<std::pair<long double, std::size_t>>{};
++          JoinCandidates{};
+       std::size_t join = npos;
+       if (!mandatory) {
+         if (growing && nodes_.size() < capacity_) {
+@@ -553,11 +581,12 @@
+             if (can_split(i) && nodes_[i].mass > 0 && heuristic(i) > score) {
+               split = i; score = heuristic(i);
+             }
+-        } else if (nodes_.size() == capacity_ && joins.size() >= (capacity_ + 2) / 3 + 2) {
++        } else if (nodes_.size() == capacity_ && joins.count >= (capacity_ + 2) / 3 + 2) {
+           long double gain = 0;
+           for (std::size_t i = 1; i < nodes_.size(); ++i) {
+-            if (!can_split(i) || nodes_[i].mass <= 2 * static_cast<long double>(count_) / capacity_) continue;
+-            for (const auto& candidate : joins) {
++            if (nodes_[i].mass <= 2 * static_cast<long double>(count_) / capacity_ || !can_split(i)) continue;
++            for (const auto& candidate : joins.best) {
++              if (candidate.second == npos) break;
+               if (candidate.second == i || candidate.second + 1 == i) continue;
+               const long double value = heuristic(i) - 1.5L * candidate.first;
+               if (value > gain) { gain = value; split = i; join = candidate.second; }
+@@ -568,15 +597,16 @@
+       }
+       if (split == npos) break;
+       if (nodes_.size() < capacity_) { split_at(split, before); continue; }
+-      if (join == npos)
+-        for (const auto& candidate : joins)
+-          if (candidate.second != split && candidate.second + 1 != split) { join = candidate.second; break; }
++      if (join == npos) join = joins.nonoverlapping(split);
+       if (join == npos) { raise_bound(); continue; }
+       // Join first so vector capacity never needs more than k slots here.
+       join_at(join);
+       if (join < split) --split;
+       split_at(split, before);
+     }
++    // Edits read masses/prefixes and the frozen snapshot, never live slopes.
++    // Restore slopes before another batch snapshot or public query uses them.
++    rebuild(nodes_);
+   }
+ };
+ 

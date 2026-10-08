@@ -1,0 +1,174 @@
+--- a/SplineSketch.java
++++ b/SplineSketch.java
+@@ -953,33 +953,20 @@
+             final int n = x.length;
+             double[] d = new double[n];
+ 
+-            // 1) Compute slopes of each interval: m_k = (y[k+1] - y[k]) / (x[k+1] - x[k])
+-            double[] mk = new double[n - 1];
+-            for (int k = 0; k < n - 1; k++) {
+-                mk[k] = (y[k + 1] - y[k]) / (x[k + 1] - x[k]);
+-            }
+-
+-            // 2) For interior points k=1..n-2, compute derivative d[k].
+-            //    If mk[k] == 0 or mk[k-1] == 0 or they have opposite signs => d[k] = 0
+-            //    Otherwise, use the weighted harmonic mean.
+-            //    w1 = 2*h[k] + h[k-1], w2 = h[k] + 2*h[k-1]
+-            //    1/d[k] = (w1/mk[k-1] + w2/mk[k]) / (w1 + w2)
+-            double[] h = new double[n - 1];
+-            for (int k = 0; k < n - 1; k++) {
+-                h[k] = x[k + 1] - x[k];
+-            }
+-
+-            // We'll fill in d[1..n-2] using the formula or zero
++            // Keep only the two adjacent gaps/slopes. Each expression and
++            // its operation order match the original array-based kernel.
++            double leftH = x[1] - x[0], rightH = x[2] - x[1];
++            double leftM = (y[1] - y[0]) / leftH;
++            double rightM = (y[2] - y[1]) / rightH;
++            d[0] = edgeSlope(leftH, rightH, leftM, rightM);
+             for (int k = 1; k < n - 1; k++) {
+-                double mk0 = mk[k - 1];
+-                double mk1 = mk[k];
+-
++                double mk0 = leftM, mk1 = rightM;
+                 // Check sign or zero:
+                 if (mk0 == 0.0 || mk1 == 0.0 || (mk0 > 0 && mk1 < 0) || (mk0 < 0 && mk1 > 0)) {
+                     d[k] = 0.0;
+                 } else {
+-                    double w1 = 2.0 * h[k] + h[k - 1];
+-                    double w2 = h[k] + 2.0 * h[k - 1];
++                    double w1 = 2.0 * rightH + leftH;
++                    double w2 = rightH + 2.0 * leftH;
+                     double denom = (w1 + w2);
+ 
+                     // Weighted harmonic mean:
+@@ -993,13 +980,13 @@
+                         d[k] = 1.0 / whmean;
+                     }
+                 }
+-            }
+-
+-            // 3) Handle endpoints d[0] and d[n-1] with the one-sided scheme.
+-            //    SciPy uses something akin to the method from:
+-            //    Cleve Moler, "Numerical Computing with MATLAB," Chap. 3.6 (pchiptx.m).
+-            d[0]     = edgeSlope(h[0], h[1], mk[0], mk[1]);
+-            d[n - 1] = edgeSlope(h[n - 2], h[n - 3], mk[n - 2], mk[n - 3]);
++                if (k + 1 < n - 1) {
++                    leftH = rightH; leftM = rightM;
++                    rightH = x[k + 2] - x[k + 1];
++                    rightM = (y[k + 2] - y[k + 1]) / rightH;
++                }
++            }
++            d[n - 1] = edgeSlope(rightH, leftH, rightM, leftM);
+ 
+             return d;
+         }
+--- a/SplineSketchMG.java
++++ b/SplineSketchMG.java
+@@ -851,6 +851,17 @@
+         // For each item, find rank within buffer
+         List<Integer> result = new ArrayList<>();
+         PchipLikeInterpolator spline = calcSpline();
++        // Large batches amortize sorting the retained keys. Small calls keep
++        // the original scan and do not allocate an index.
++        Double[] mgKeys = null;
++        int[] mgPrefix = null;
++        if (MGsketch.size() >= 16 && items.size() > MGsketch.size()) {
++            mgKeys = MGsketch.keySet().toArray(new Double[MGsketch.size()]);
++            Arrays.sort(mgKeys);
++            mgPrefix = new int[mgKeys.length + 1];
++            for (int j = 0; j < mgKeys.length; j++)
++                mgPrefix[j + 1] = mgPrefix[j] + MGsketch.get(mgKeys[j])[0];
++        }
+         for (int i = 0; i < items.size(); i++) {
+             double val = items.get(i); //roundToSignificantDigits(items.get(i), this.significantDigits);
+             // rank in buffer
+@@ -867,9 +878,20 @@
+                 }
+             }
+             int rankMG = 0;
+-            for (Map.Entry<Double,int[]> entry : MGsketch.entrySet()) {
+-                if (entry.getKey() <= val) {
+-                    rankMG += entry.getValue()[0];
++            if (mgKeys != null) {
++                int lo = 0, hi = mgKeys.length;
++                while (lo < hi) {
++                    int mid = (lo + hi) >>> 1;
++                    // Primitive <= preserves inclusive signed-zero behavior.
++                    if (mgKeys[mid] <= val) lo = mid + 1;
++                    else hi = mid;
++                }
++                rankMG = mgPrefix[lo];
++            } else {
++                for (Map.Entry<Double,int[]> entry : MGsketch.entrySet()) {
++                    if (entry.getKey() <= val) {
++                        rankMG += entry.getValue()[0];
++                    }
+                 }
+             }
+ 
+@@ -1050,33 +1072,20 @@
+             final int n = x.length;
+             double[] d = new double[n];
+ 
+-            // 1) Compute slopes of each interval: m_k = (y[k+1] - y[k]) / (x[k+1] - x[k])
+-            double[] mk = new double[n - 1];
+-            for (int k = 0; k < n - 1; k++) {
+-                mk[k] = (y[k + 1] - y[k]) / (x[k + 1] - x[k]);
+-            }
+-
+-            // 2) For interior points k=1..n-2, compute derivative d[k].
+-            //    If mk[k] == 0 or mk[k-1] == 0 or they have opposite signs => d[k] = 0
+-            //    Otherwise, use the weighted harmonic mean.
+-            //    w1 = 2*h[k] + h[k-1], w2 = h[k] + 2*h[k-1]
+-            //    1/d[k] = (w1/mk[k-1] + w2/mk[k]) / (w1 + w2)
+-            double[] h = new double[n - 1];
+-            for (int k = 0; k < n - 1; k++) {
+-                h[k] = x[k + 1] - x[k];
+-            }
+-
+-            // We'll fill in d[1..n-2] using the formula or zero
++            // Keep only the two adjacent gaps/slopes. Each expression and
++            // its operation order match the original array-based kernel.
++            double leftH = x[1] - x[0], rightH = x[2] - x[1];
++            double leftM = (y[1] - y[0]) / leftH;
++            double rightM = (y[2] - y[1]) / rightH;
++            d[0] = edgeSlope(leftH, rightH, leftM, rightM);
+             for (int k = 1; k < n - 1; k++) {
+-                double mk0 = mk[k - 1];
+-                double mk1 = mk[k];
+-
++                double mk0 = leftM, mk1 = rightM;
+                 // Check sign or zero:
+                 if (mk0 == 0.0 || mk1 == 0.0 || (mk0 > 0 && mk1 < 0) || (mk0 < 0 && mk1 > 0)) {
+                     d[k] = 0.0;
+                 } else {
+-                    double w1 = 2.0 * h[k] + h[k - 1];
+-                    double w2 = h[k] + 2.0 * h[k - 1];
++                    double w1 = 2.0 * rightH + leftH;
++                    double w2 = rightH + 2.0 * leftH;
+                     double denom = (w1 + w2);
+ 
+                     // Weighted harmonic mean:
+@@ -1090,13 +1099,13 @@
+                         d[k] = 1.0 / whmean;
+                     }
+                 }
+-            }
+-
+-            // 3) Handle endpoints d[0] and d[n-1] with the one-sided scheme.
+-            //    SciPy uses something akin to the method from:
+-            //    Cleve Moler, "Numerical Computing with MATLAB," Chap. 3.6 (pchiptx.m).
+-            d[0]     = edgeSlope(h[0], h[1], mk[0], mk[1]);
+-            d[n - 1] = edgeSlope(h[n - 2], h[n - 3], mk[n - 2], mk[n - 3]);
++                if (k + 1 < n - 1) {
++                    leftH = rightH; leftM = rightM;
++                    rightH = x[k + 2] - x[k + 1];
++                    rightM = (y[k + 2] - y[k + 1]) / rightH;
++                }
++            }
++            d[n - 1] = edgeSlope(rightH, leftH, rightM, leftM);
+ 
+             return d;
+         }

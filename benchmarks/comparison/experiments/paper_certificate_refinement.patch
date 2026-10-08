@@ -1,0 +1,67 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -103,7 +103,7 @@
+   template<bool Enabled = TrackBounds, std::enable_if_t<Enabled && TrackBounds, int> = 0>
+   double max_rank_error() const noexcept {
+     const auto width = max_rank_uncertainty();
+-    if (count_ <= (std::uint64_t{1} << 53)) return outward_integer(width, true);
++    if (count_ <= (std::uint64_t{1} << 53)) return prefix_error_bound(width);
+     const double rounded_count = static_cast<double>(count_);
+     const double allowance = std::nextafter(rounded_count, INFINITY) - rounded_count;
+     return round_up(outward_integer(width, true) + allowance);
+@@ -397,6 +397,55 @@
+       value = static_cast<double>(interval.lower + (interval.upper - interval.lower) / 2);
+     return std::clamp(value, static_cast<double>(interval.lower), static_cast<double>(interval.upper));
+   }
++  // Intersect the integer-width guarantee with the actual spline-prefix
++  // bracket. This does not assume monotone cubic evaluation: finite values
++  // are clamped to their endpoint prefixes, and a nonfinite value uses the
++  // integer midpoint. Exact-data additions and return conversion have a
++  // conservative ULP allowance. Unsupported prefixes retain the width bound.
++  double prefix_error_bound(std::uint64_t width) const noexcept {
++    if constexpr (!TrackBounds) return static_cast<double>(width);
++    else {
++      const double fallback = static_cast<double>(width);
++      if (!width || nodes_.empty()) return fallback;
++      const auto additions = buffer_.size() + heavy_.size();
++      if (additions > (std::uint64_t{1} << 48) - 3 ||
++          !std::isfinite(nodes_.back().prefix) || nodes_.back().prefix < 0) return fallback;
++      const double top = std::nextafter(static_cast<double>(nodes_.back().prefix), INFINITY);
++      const double sum = round_up(top + static_cast<double>(count_));
++      const double ceiling = round_up(2 * sum);
++      if (!std::isfinite(ceiling)) return fallback;
++      const double ulp = std::nextafter(ceiling, INFINITY) - ceiling;
++      // h additions, one return conversion, one prefix conversion and one
++      // endpoint-distance subtraction, each bounded by this common ULP.
++      const double rounding = round_up(static_cast<double>(additions + 3) * ulp);
++      if (!std::isfinite(rounding)) return fallback;
++      double bound = 0, previous_prefix = 0;
++      for (std::size_t i = 0; i < nodes_.size(); ++i) {
++        const auto& node = nodes_[i];
++        if (!std::isfinite(node.prefix) || node.prefix < 0 ||
++            (i && node.prefix < nodes_[i - 1].prefix)) return fallback;
++        const double prefix = static_cast<double>(node.prefix);
++        const auto point_width = node.upper - node.lower;
++        if (point_width) {
++          const double point = std::max(std::fabs(prefix - static_cast<double>(node.upper)),
++                                        std::fabs(prefix - static_cast<double>(node.lower)));
++          bound = std::max(bound, std::min(static_cast<double>(point_width), round_up(point + rounding)));
++        }
++        if (i && std::nextafter(nodes_[i - 1].x, INFINITY) < node.x) {
++          const auto lower = nodes_[i - 1].lower, upper = node.upper - node.atom;
++          const auto interval_width = upper - lower;
++          const double extent = std::max(std::fabs(previous_prefix - static_cast<double>(upper)),
++                                         std::fabs(prefix - static_cast<double>(lower)));
++          const double finite = std::min(static_cast<double>(interval_width), round_up(extent + rounding));
++          const double nonfinite = static_cast<double>(interval_width / 2 + interval_width % 2);
++          bound = std::max(bound, std::max(finite, nonfinite));
++        }
++        if (bound >= fallback) return fallback;
++        previous_prefix = prefix;
++      }
++      return std::min(fallback, bound);
++    }
++  }
+   // Reuse the ordered reestimation cursors instead of searching each key.
+   static void set_bounds(Node& node, const Snapshot& before, std::size_t old, std::size_t pending) {
+     if constexpr (TrackBounds) {

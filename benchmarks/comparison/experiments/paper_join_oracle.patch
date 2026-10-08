@@ -1,0 +1,35 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -763,6 +763,15 @@
+     // therefore contain exactly the first legal non-overlapping sorted join.
+     return result;
+   }
++  // Offline-only hook. The generated experiment copy has no instance state.
++  using OracleJoinHook = std::size_t (*)(const BasicPaperSplineSketch&, std::size_t, std::size_t, unsigned);
++  inline static OracleJoinHook oracle_join_hook_ = nullptr;
++  std::size_t oracle_join(std::size_t original, std::size_t split, unsigned kind) const {
++    if constexpr (TrackBounds) {
++      if (oracle_join_hook_) return oracle_join_hook_(*this, original, split, kind);
++    }
++    return original;
++  }
+   void raise_bound() {
+     if (policy_ == BoundPolicy::theoretical)
+       throw std::logic_error("paper baseline cannot find a legal join");
+@@ -1255,7 +1264,7 @@
+     while (nodes_.size() > capacity_) {
+       const auto joins = join_candidates();
+       if (!joins.count) { raise_bound(); continue; }
+-      join_at(joins.best.front().second);
++      join_at(oracle_join(joins.best.front().second, npos, 0));
+     }
+     for (;;) {
+       std::size_t split = npos;
+@@ -1293,6 +1302,7 @@
+       if (nodes_.size() < capacity_) { split_at(split, before); continue; }
+       if (join == npos) join = joins.nonoverlapping(split);
+       if (join == npos) { raise_bound(); continue; }
++      join = oracle_join(join, split, mandatory ? 1 : 2);
+       // Join first so vector capacity never needs more than k slots here.
+       join_at(join);
+       if (join < split) --split;

@@ -1,0 +1,98 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -763,6 +763,30 @@
+     // therefore contain exactly the first legal non-overlapping sorted join.
+     return result;
+   }
++  std::size_t certificate_join(std::size_t original, std::size_t split = npos) const {
++    if constexpr (!TrackBounds) return original;
++    else {
++      const auto width = [&](std::size_t i) {
++        return nodes_[i + 1].upper - nodes_[i + 1].atom - nodes_[i - 1].lower;
++      };
++      const auto current = max_rank_uncertainty();
++      if (width(original) <= current) return original;
++      auto best = original;
++      auto best_width = width(best);
++      auto best_score = heuristic(best, true);
++      for (std::size_t i = 1; i + 1 < nodes_.size(); ++i) {
++        if (i == split || i + 1 == split || nodes_[i].protected_threshold ||
++            !(nodes_[i].mass + nodes_[i + 1].mass <= 0.75L * bound())) continue;
++        const auto candidate_width = width(i);
++        if (candidate_width > best_width) continue;
++        const auto score = heuristic(i, true);
++        if (candidate_width < best_width || score < best_score || (score == best_score && i < best)) {
++          best = i; best_width = candidate_width; best_score = score;
++        }
++      }
++      return std::max(current, best_width) < width(original) ? best : original;
++    }
++  }
+   void raise_bound() {
+     if (policy_ == BoundPolicy::theoretical)
+       throw std::logic_error("paper baseline cannot find a legal join");
+@@ -1024,6 +1048,30 @@
+       for (Id id : candidates) if (id != none && !overlaps(id, split_id)) return id;
+       return none;
+     }
++    Id certificate_join(Id original, Id split_id = none) const {
++      if constexpr (!TrackBounds) return original;
++      else {
++        const auto width = [&](Id id) {
++          const auto left = links[id].prev, right = links[id].next;
++          return sketch.nodes_[right].upper - sketch.nodes_[right].atom - sketch.nodes_[left].lower;
++        };
++        std::uint64_t current = 0;
++        for (Id id = head; id != none; id = links[id].next) {
++          const auto& node = sketch.nodes_[id];
++          current = std::max(current, node.upper - node.lower);
++          const auto left = links[id].prev;
++          if (left != none && std::nextafter(sketch.nodes_[left].x, INFINITY) < node.x)
++            current = std::max(current, node.upper - node.atom - sketch.nodes_[left].lower);
++        }
++        if (width(original) <= current) return original;
++        auto best = original;
++        for (Id id : joins.entries) {
++          if (split_id != none && overlaps(id, split_id)) continue;
++          if (width(id) < width(best) || (width(id) == width(best) && joins.better(id, best))) best = id;
++        }
++        return std::max(current, width(best)) < width(original) ? best : original;
++      }
++    }
+     void raise() {
+       if (sketch.policy_ == BoundPolicy::theoretical)
+         throw std::logic_error("paper baseline cannot find a legal join");
+@@ -1185,7 +1233,7 @@
+     void run(bool materialize = true) {
+       while (size > sketch.capacity_) {
+         if (joins.top() == none) { raise(); continue; }
+-        join(joins.top());
++        join(certificate_join(joins.top()));
+         verify();
+       }
+       for (;;) {
+@@ -1203,6 +1251,7 @@
+         if (size < sketch.capacity_) { split(split_id); verify(); continue; }
+         if (join_id == none) join_id = compatible(candidates, split_id);
+         if (join_id == none) { raise(); continue; }
++        if (mandatory) join_id = certificate_join(join_id, split_id);
+         join(join_id); split(split_id);
+         verify();
+       }
+@@ -1255,7 +1304,7 @@
+     while (nodes_.size() > capacity_) {
+       const auto joins = join_candidates();
+       if (!joins.count) { raise_bound(); continue; }
+-      join_at(joins.best.front().second);
++      join_at(certificate_join(joins.best.front().second));
+     }
+     for (;;) {
+       std::size_t split = npos;
+@@ -1293,6 +1342,7 @@
+       if (nodes_.size() < capacity_) { split_at(split, before); continue; }
+       if (join == npos) join = joins.nonoverlapping(split);
+       if (join == npos) { raise_bound(); continue; }
++      if (mandatory) join = certificate_join(join, split);
+       // Join first so vector capacity never needs more than k slots here.
+       join_at(join);
+       if (join < split) --split;

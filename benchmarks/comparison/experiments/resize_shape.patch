@@ -1,0 +1,72 @@
+--- a/include/splinesketch/splinesketch.hpp
++++ b/include/splinesketch/splinesketch.hpp
+@@ -227,7 +227,7 @@
+     if (pending_.size() >= capacity_) consolidate_in_place();
+   }
+ 
+-  void consolidate_in_place() {
++  void consolidate_in_place(bool preserve_shape = false) {
+     if (pending_.empty()) return;
+     advance_epoch();
+     Snapshot before{nodes_, pending_, {}};
+@@ -244,7 +244,7 @@
+       reestimate(before);
+     }
+     pending_.clear();
+-    reduce_to_capacity();
++    reduce_to_capacity(preserve_shape);
+     rebalance(before);
+   }
+ 
+@@ -259,8 +259,8 @@
+     pending_.reserve(capacity_ + 2);
+     heavy_.reserve(capacity_);
+     shrink_heavy();
+-    consolidate_in_place();
+-    reduce_to_capacity();
++    consolidate_in_place(true);
++    reduce_to_capacity(true);
+     if (nodes_.size() < capacity_) {
+       Snapshot before{nodes_, {}, {}};
+       while (nodes_.size() < capacity_) {
+@@ -558,12 +558,36 @@
+     }
+     return best;
+   }
+-  void reduce_to_capacity() {
++  void reduce_to_capacity(bool preserve_shape = false) {
+     const auto old_size = nodes_.size();
++    const auto reference = preserve_shape ? nodes_ : std::vector<Node>{};
++    auto trial = reference;
++    const auto choose = [&](bool enforce_bound, bool enforce_protection) {
++      std::size_t best = npos;
++      long double best_error = std::numeric_limits<long double>::infinity();
++      for (std::size_t i = 1; i + 1 < nodes_.size(); ++i) {
++        if (enforce_protection && nodes_[i].protected_threshold) continue;
++        if (enforce_bound && nodes_[i].mass + nodes_[i+1].mass > 0.75L * bound()) continue;
++        trial = nodes_;
++        trial[i+1].mass += trial[i].mass;
++        trial.erase(trial.begin() + static_cast<std::ptrdiff_t>(i));
++        rebuild(trial);
++        long double error = 0;
++        for (std::size_t j = 0; j < reference.size(); ++j) {
++          error = std::max(error, std::fabs(spline_rank(trial, reference[j].x) - reference[j].prefix));
++          if (j) {
++            const double x = midpoint(reference[j-1].x, reference[j].x);
++            error = std::max(error, std::fabs(spline_rank(trial, x) - spline_rank(reference, x)));
++          }
++        }
++        if (best == npos || error < best_error) { best = i; best_error = error; }
++      }
++      return best;
++    };
+     while (nodes_.size() > capacity_) {
+-      auto join = best_join();
+-      if (join == npos) join = best_join(npos, false, true);
+-      if (join == npos) join = best_join(npos, false, false);
++      auto join = preserve_shape ? choose(true, true) : best_join();
++      if (join == npos) join = preserve_shape ? choose(false, true) : best_join(npos, false, true);
++      if (join == npos) join = preserve_shape ? choose(false, false) : best_join(npos, false, false);
+       if (join == npos) break;
+ #ifdef SPLINESKETCH_VERIFY_GUARANTEES
+       // This path is allowed by the production algorithm but not by the

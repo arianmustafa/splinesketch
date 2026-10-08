@@ -1,0 +1,68 @@
+--- a/include/splinesketch/splinesketch.hpp
++++ b/include/splinesketch/splinesketch.hpp
+@@ -227,7 +227,7 @@
+     if (pending_.size() >= capacity_) consolidate_in_place();
+   }
+ 
+-  void consolidate_in_place() {
++  void consolidate_in_place(bool preserve_shape = false) {
+     if (pending_.empty()) return;
+     advance_epoch();
+     Snapshot before{nodes_, pending_, {}};
+@@ -244,7 +244,7 @@
+       reestimate(before);
+     }
+     pending_.clear();
+-    reduce_to_capacity();
++    reduce_to_capacity(preserve_shape);
+     rebalance(before);
+   }
+ 
+@@ -259,8 +259,8 @@
+     pending_.reserve(capacity_ + 2);
+     heavy_.reserve(capacity_);
+     shrink_heavy();
+-    consolidate_in_place();
+-    reduce_to_capacity();
++    consolidate_in_place(true);
++    reduce_to_capacity(true);
+     if (nodes_.size() < capacity_) {
+       Snapshot before{nodes_, {}, {}};
+       while (nodes_.size() < capacity_) {
+@@ -512,14 +512,17 @@
+                     std::fabs(dn - density) / (h + hn)) * h * h;
+   }
+   std::size_t best_join(std::size_t avoid = npos, bool enforce_bound = true,
+-                        bool enforce_protection = true) const {
++                        bool enforce_protection = true, bool preserve_shape = false) const {
+     std::size_t best = npos;
+     long double score = std::numeric_limits<long double>::infinity();
+     for (std::size_t i = 1; i + 1 < nodes_.size(); ++i) {
+       if (i == avoid || (avoid != npos && i + 1 == avoid)) continue;
+       if (enforce_protection && nodes_[i].protected_threshold) continue;
+       if (enforce_bound && nodes_[i].mass + nodes_[i + 1].mass > 0.75L * bound()) continue;
+-      const long double candidate = joined_heuristic(i);
++      const long double candidate = preserve_shape ?
++          std::fabs(nodes_[i].mass - (nodes_[i].mass + nodes_[i + 1].mass) *
++                    (span(nodes_[i-1].x, nodes_[i].x) / span(nodes_[i-1].x, nodes_[i+1].x))) :
++          joined_heuristic(i);
+       if (candidate < score) { score = candidate; best = i; }
+     }
+     return best;
+@@ -558,12 +561,12 @@
+     }
+     return best;
+   }
+-  void reduce_to_capacity() {
++  void reduce_to_capacity(bool preserve_shape = false) {
+     const auto old_size = nodes_.size();
+     while (nodes_.size() > capacity_) {
+-      auto join = best_join();
+-      if (join == npos) join = best_join(npos, false, true);
+-      if (join == npos) join = best_join(npos, false, false);
++      auto join = best_join(npos, true, true, preserve_shape);
++      if (join == npos) join = best_join(npos, false, true, preserve_shape);
++      if (join == npos) join = best_join(npos, false, false, preserve_shape);
+       if (join == npos) break;
+ #ifdef SPLINESKETCH_VERIFY_GUARANTEES
+       // This path is allowed by the production algorithm but not by the

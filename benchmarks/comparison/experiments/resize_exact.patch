@@ -1,0 +1,109 @@
+--- a/include/splinesketch/splinesketch.hpp
++++ b/include/splinesketch/splinesketch.hpp
+@@ -227,7 +227,7 @@
+     if (pending_.size() >= capacity_) consolidate_in_place();
+   }
+ 
+-  void consolidate_in_place() {
++  void consolidate_in_place(bool preserve_shape = false) {
+     if (pending_.empty()) return;
+     advance_epoch();
+     Snapshot before{nodes_, pending_, {}};
+@@ -244,7 +244,7 @@
+       reestimate(before);
+     }
+     pending_.clear();
+-    reduce_to_capacity();
++    reduce_to_capacity(preserve_shape);
+     rebalance(before);
+   }
+ 
+@@ -259,8 +259,8 @@
+     pending_.reserve(capacity_ + 2);
+     heavy_.reserve(capacity_);
+     shrink_heavy();
+-    consolidate_in_place();
+-    reduce_to_capacity();
++    consolidate_in_place(true);
++    reduce_to_capacity(true);
+     if (nodes_.size() < capacity_) {
+       Snapshot before{nodes_, {}, {}};
+       while (nodes_.size() < capacity_) {
+@@ -558,12 +558,73 @@
+     }
+     return best;
+   }
+-  void reduce_to_capacity() {
++  // Maximum cubic difference when candidate thresholds are a subset of the
++  // reference thresholds and both sketches have identical extrema.
++  static long double spline_distance(const std::vector<Node>& reference,
++                                     const std::vector<Node>& candidate) {
++    long double error = 0;
++    std::size_t at = 1;
++    for (std::size_t j = 1; j < reference.size(); ++j) {
++      const auto& a = reference[j - 1];
++      const auto& b = reference[j];
++      while (at + 1 < candidate.size() && candidate[at].x <= a.x) ++at;
++      const auto& left = candidate[at - 1];
++      const auto& right = candidate[at];
++      const long double h = span(a.x, b.x), width = span(left.x, right.x);
++      const long double start = span(left.x, a.x) / width, scale = h / width;
++      const long double mass = right.prefix - left.prefix;
++      const long double c1 = width * left.slope;
++      const long double c2 = 3 * mass - width * (2 * left.slope + right.slope);
++      const long double c3 = width * (left.slope + right.slope) - 2 * mass;
++      const long double d0 = left.prefix - a.prefix + start * (c1 + start * (c2 + start * c3));
++      const long double d1 = scale * (c1 + start * (2 * c2 + 3 * start * c3)) - h * a.slope;
++      const long double d2 = scale * scale * (c2 + 3 * start * c3) - (3 * b.mass - h * (2 * a.slope + b.slope));
++      const long double d3 = scale * scale * scale * c3 - (h * (a.slope + b.slope) - 2 * b.mass);
++      if (!std::isfinite(d0) || !std::isfinite(d1) || !std::isfinite(d2) || !std::isfinite(d3))
++        return std::numeric_limits<long double>::infinity();
++      const auto sample = [&](long double t) {
++        if (t >= 0 && t <= 1) error = std::max(error, std::fabs(d0 + t * (d1 + t * (d2 + t * d3))));
++      };
++      sample(0); sample(1);
++      const long double norm = std::max({std::fabs(d1), std::fabs(d2), std::fabs(d3)});
++      if (norm == 0) continue;
++      const long double qa = 3 * (d3 / norm), qb = 2 * (d2 / norm), qc = d1 / norm;
++      if (qa == 0) { if (qb != 0) sample(-qc / qb); }
++      else {
++        const long double disc = qb * qb - 4 * qa * qc;
++        if (disc >= 0) {
++          const long double q = -0.5L * (qb + std::copysign(std::sqrt(disc), qb));
++          sample(q / qa);
++          if (q != 0) sample(qc / q);
++        }
++      }
++    }
++    return error;
++  }
++  void reduce_to_capacity(bool preserve_shape = false) {
+     const auto old_size = nodes_.size();
++    if (old_size <= capacity_) return;
++    const auto reference = preserve_shape ? nodes_ : std::vector<Node>{};
++    auto trial = reference;
++    const auto choose = [&](bool enforce_bound, bool enforce_protection) {
++      std::size_t best = npos;
++      long double best_error = std::numeric_limits<long double>::infinity();
++      for (std::size_t i = 1; i + 1 < nodes_.size(); ++i) {
++        if (enforce_protection && nodes_[i].protected_threshold) continue;
++        if (enforce_bound && nodes_[i].mass + nodes_[i+1].mass > 0.75L * bound()) continue;
++        trial = nodes_;
++        trial[i+1].mass += trial[i].mass;
++        trial.erase(trial.begin() + static_cast<std::ptrdiff_t>(i));
++        rebuild(trial);
++        const long double error = spline_distance(reference, trial);
++        if (best == npos || error < best_error) { best = i; best_error = error; }
++      }
++      return best;
++    };
+     while (nodes_.size() > capacity_) {
+-      auto join = best_join();
+-      if (join == npos) join = best_join(npos, false, true);
+-      if (join == npos) join = best_join(npos, false, false);
++      auto join = preserve_shape ? choose(true, true) : best_join();
++      if (join == npos) join = preserve_shape ? choose(false, true) : best_join(npos, false, true);
++      if (join == npos) join = preserve_shape ? choose(false, false) : best_join(npos, false, false);
+       if (join == npos) break;
+ #ifdef SPLINESKETCH_VERIFY_GUARANTEES
+       // This path is allowed by the production algorithm but not by the

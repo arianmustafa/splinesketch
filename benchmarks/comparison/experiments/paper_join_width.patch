@@ -1,0 +1,66 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -745,6 +745,17 @@
+       return npos;
+     }
+   };
++  bool better_join(const typename JoinCandidates::Candidate& a,
++                   const typename JoinCandidates::Candidate& b) const {
++    if constexpr (TrackBounds) {
++      const auto width = [&](std::size_t i) {
++        return nodes_[i + 1].upper - nodes_[i + 1].atom - nodes_[i - 1].lower;
++      };
++      const auto x = width(a.second), y = width(b.second);
++      if (x != y) return x < y;
++    }
++    return a < b;
++  }
+   JoinCandidates join_candidates() const {
+     JoinCandidates result;
+     const auto limit = 0.75L * bound();
+@@ -753,7 +764,7 @@
+       ++result.count;
+       const typename JoinCandidates::Candidate candidate{heuristic(i, true), i};
+       for (std::size_t j = 0; j < result.best.size(); ++j)
+-        if (result.best[j].second == npos || candidate < result.best[j]) {
++        if (result.best[j].second == npos || better_join(candidate, result.best[j])) {
+           for (std::size_t at = result.best.size() - 1; at > j; --at) result.best[at] = result.best[at - 1];
+           result.best[j] = candidate;
+           break;
+@@ -818,6 +829,17 @@
+         return kind == mass_heap ? node.mass : kind == split_heap ? node.prefix : node.slope;
+       }
+       bool better(Id a, Id b) const {
++        if constexpr (TrackBounds) {
++          if (kind == join_heap) {
++            const auto width = [&](Id id) {
++              const auto left = state.links[id].prev, right = state.links[id].next;
++              const auto& nodes = state.sketch.nodes_;
++              return nodes[right].upper - nodes[right].atom - nodes[left].lower;
++            };
++            const auto x = width(a), y = width(b);
++            if (x != y) return x < y;
++          }
++        }
+         const auto x = key(a), y = key(b);
+         if (x != y) return kind == join_heap ? x < y : x > y;
+         return state.sketch.nodes_[a].x < state.sketch.nodes_[b].x;
+@@ -1109,7 +1131,17 @@
+             ? snapshot.nodes[old].prefix : spline_rank(snapshot.nodes, x);
+         const long double value = old_rank + (pending ? snapshot.sums[pending - 1] : 0);
+         const long double mass = std::max(0.0L, value - previous);
+-        set_bounds(sketch.nodes_[id], snapshot, old, pending);
++        if constexpr (TrackBounds) {
++          auto updated = sketch.nodes_[id];
++          set_bounds(updated, snapshot, old, pending);
++          // Join keys depend on neighbouring integer bounds. Detach all
++          // affected keys BEFORE mutating an endpoint, even if mass is equal.
++          if (updated.lower != sketch.nodes_[id].lower || updated.upper != sketch.nodes_[id].upper ||
++              updated.atom != sketch.nodes_[id].atom) mark_neighbours(id);
++          sketch.nodes_[id].lower = updated.lower;
++          sketch.nodes_[id].upper = updated.upper;
++          sketch.nodes_[id].atom = updated.atom;
++        }
+         if (mass != sketch.nodes_[id].mass) {
+           mark_neighbours(id);
+           sketch.nodes_[id].mass = mass;

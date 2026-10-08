@@ -1,0 +1,50 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -730,8 +730,37 @@
+     nodes_.erase(nodes_.begin() + static_cast<std::ptrdiff_t>(i));
+     rebuild_prefixes();
+   }
++  double split_position(const Node& left, const Node& right, const Snapshot& before) const {
++    const double mid = midpoint(left.x, right.x);
++    if constexpr (!TrackBounds) return mid;
++    else {
++      if (before.items.empty()) return mid;
++      const auto first = std::upper_bound(before.items.begin(), before.items.end(), left.x,
++          [](double value, const Item& item) { return value < item.first; });
++      const auto last = std::lower_bound(first, before.items.end(), right.x,
++          [](const Item& item, double value) { return item.first < value; });
++      if (first == last) return mid;
++      const auto low = static_cast<std::size_t>(first - before.items.begin());
++      const auto high = static_cast<std::size_t>(last - before.items.begin());
++      const auto base = low ? before.sums[low - 1] : 0;
++      const auto weight = before.sums[high - 1] - base;
++      const auto target = base + weight / 2 + weight % 2;
++      const auto at = std::lower_bound(before.sums.begin() + static_cast<std::ptrdiff_t>(low),
++          before.sums.begin() + static_cast<std::ptrdiff_t>(high), target);
++      const double candidate = before.items[static_cast<std::size_t>(at - before.sums.begin())].first;
++      const auto t = fraction(left.x, right.x, candidate);
++      if (!(t >= 0.25L && t <= 0.75L)) return mid;
++      const auto score = [&](double x) {
++        const auto bound = before.bounds(x);
++        return std::max({bound.upper - bound.lower,
++                         bound.upper - before.atom(x) - left.lower,
++                         right.upper - right.atom - bound.lower});
++      };
++      return score(candidate) < score(mid) ? candidate : mid;
++    }
++  }
+   void split_at(std::size_t i, const Snapshot& before) {
+-    const auto mid = midpoint(nodes_[i - 1].x, nodes_[i].x);
++    const auto mid = split_position(nodes_[i - 1], nodes_[i], before);
+     const auto left = nodes_[i - 1].prefix, right = nodes_[i].prefix;
+     const long double value = std::clamp(before.rank(mid), left, right);
+     nodes_.insert(nodes_.begin() + static_cast<std::ptrdiff_t>(i), Node{mid, value - left, 0, 0, true});
+@@ -936,7 +965,7 @@
+     void split(Id right) {
+       if (!splittable(right)) throw std::logic_error("unsplittable paper heap bucket");
+       const auto left = links[right].prev;
+-      const auto mid = midpoint(sketch.nodes_[left].x, sketch.nodes_[right].x);
++      const auto mid = sketch.split_position(sketch.nodes_[left], sketch.nodes_[right], *before);
+       // Ordered summation deliberately matches the scanning implementation.
+       // An associative tree would change floating-point inverse boundaries.
+       long double low = 0, high = 0;

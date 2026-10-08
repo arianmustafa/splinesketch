@@ -1,0 +1,62 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -41,6 +41,7 @@
+       return;
+     }
+     PaperSplineSketch updated(*this);
++    updated.buffer_.reserve(5 * capacity_);
+     updated.buffer_.push_back(value);
+     ++updated.count_;
+     updated.consolidate_in_place();
+@@ -71,10 +72,32 @@
+     if (q == 0) return lo;
+     if (q == 1) return hi;
+     const long double target = std::ceil(q * static_cast<long double>(count_));
++    const std::size_t exact_size = buffer_.size() + heavy_.size();
+     auto low = SplineSketch::ordered_bits(lo), high = SplineSketch::ordered_bits(hi);
++    if (exact_size <= 16) {
++      while (low < high) {
++        const auto mid = low + (high - low) / 2;
++        if (rank(SplineSketch::from_ordered_bits(mid)) >= target) high = mid;
++        else low = mid + 1;
++      }
++      return SplineSketch::from_ordered_bits(low);
++    }
++    Snapshot exact{{}, {}, {}};
++    exact.items.reserve(exact_size);
++    for (double x : buffer_) exact.items.emplace_back(x, 1);
++    for (const auto& item : heavy_) exact.items.emplace_back(item.first, item.second.exact);
++    exact.prepare();
++    const long double slack = static_cast<long double>(count_) *
++        (4 * (static_cast<long double>(exact_size) + 1) * std::numeric_limits<long double>::epsilon() +
++         std::numeric_limits<double>::epsilon());
++    const auto reaches = [&](double x) {
++      const auto value = spline_rank(nodes_, x) + exact.rank(x);
++      if (std::fabs(value - target) <= slack) return rank(x) >= target;
++      return static_cast<double>(std::clamp(value, 0.0L, static_cast<long double>(count_))) >= target;
++    };
+     while (low < high) {
+       const auto mid = low + (high - low) / 2;
+-      if (rank(SplineSketch::from_ordered_bits(mid)) >= target) high = mid;
++      if (reaches(SplineSketch::from_ordered_bits(mid))) high = mid;
+       else low = mid + 1;
+     }
+     return SplineSketch::from_ordered_bits(low);
+@@ -83,6 +106,7 @@
+   void consolidate() {
+     if (buffer_.empty()) return;
+     PaperSplineSketch updated(*this);
++    updated.buffer_.reserve(5 * capacity_);
+     updated.consolidate_in_place();
+     *this = std::move(updated);
+   }
+@@ -520,7 +544,8 @@
+         if (nodes_[i].mass > score) { split = i; score = nodes_[i].mass; }
+       }
+       mandatory = split != npos;
+-      const auto joins = join_candidates();
++      const auto joins = nodes_.size() >= capacity_ ? join_candidates() :
++          std::vector<std::pair<long double, std::size_t>>{};
+       std::size_t join = npos;
+       if (!mandatory) {
+         if (growing && nodes_.size() < capacity_) {
