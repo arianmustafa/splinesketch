@@ -326,6 +326,34 @@ static void repeated_capacity_changes() {
   }
 }
 
+static void exact_discrete_capacity_changes() {
+  // Separate seeded data exposed a resize join score that improved a clustered
+  // witness while discarding exact atoms here. Preserve the existing exact
+  // certificates through repeated shrink/grow cycles on these 17 keys.
+  for (auto policy : {Certified::BoundPolicy::practical, Certified::BoundPolicy::theoretical}) {
+    Certified sketch(32, policy);
+    Paper raw(32, policy == Certified::BoundPolicy::practical
+        ? Paper::BoundPolicy::practical : Paper::BoundPolicy::theoretical);
+    std::mt19937_64 random(97);
+    std::map<double, std::uint64_t> truth;
+    for (unsigned i = 0; i < 269; ++i) {
+      const double value = static_cast<double>(random() % 17) - 8;
+      sketch.add(value); raw.add(value); ++truth[value];
+    }
+    sketch.consolidate(); raw.consolidate();
+    const auto verify = [&] {
+      assert(sketch.count() == 269 && raw.count() == 269);
+      assert(sketch.max_rank_uncertainty() == 0 && sketch.max_rank_error() == 0);
+      queries(sketch, truth, &raw);
+    };
+    verify();
+    for (unsigned i = 0; i < 24; ++i) {
+      sketch.resize(i % 2 ? 32 : 16); raw.resize(i % 2 ? 32 : 16);
+      verify();
+    }
+  }
+}
+
 static void large_counts() {
   Certified sketch(6), power(6);
   power.add(0);
@@ -489,6 +517,7 @@ int main() {
   clustered_extreme_queries();
   capacity_growth_preserves_certificates();
   repeated_capacity_changes();
+  exact_discrete_capacity_changes();
   for (auto policy : {Paper::BoundPolicy::practical, Paper::BoundPolicy::theoretical}) {
     protected_grid_updates<Paper>(policy);
     shrink_extrema_reserve<Paper>(policy);
