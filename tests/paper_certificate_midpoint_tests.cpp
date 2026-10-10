@@ -23,15 +23,67 @@ static std::uint64_t bits(double value) {
 
 namespace splinesketch {
 struct PaperCertificateInspector {
-  static void append_queries(const Sketch& sketch, std::vector<double>& queries) {
-    for (const auto& node : sketch.nodes_) {
-      queries.push_back(node.x);
-      queries.push_back(std::nextafter(node.x, -INFINITY));
-      queries.push_back(std::nextafter(node.x, INFINITY));
+  static std::vector<double> partition(const Sketch& sketch) {
+    std::vector<double> queries{-INFINITY, INFINITY};
+    const auto append = [&](double key) {
+      queries.push_back(key);
+      queries.push_back(std::nextafter(key, -INFINITY));
+      queries.push_back(std::nextafter(key, INFINITY));
+    };
+    for (std::size_t i = 0; i < sketch.nodes_.size(); ++i) {
+      const auto& node = sketch.nodes_[i];
+      require(node.lower <= node.upper && node.upper <= sketch.count_ && node.atom <= node.lower,
+              "invalid certificate node");
+      if (i) {
+        const auto& previous = sketch.nodes_[i - 1];
+        require(previous.x < node.x, "grid keys not ordered");
+        require(previous.lower <= node.lower && node.atom <= node.lower - previous.lower &&
+                previous.upper <= node.upper && node.atom <= node.upper - previous.upper,
+                "envelope jump smaller than retained atom");
+      }
+      append(node.x);
     }
+    for (double value : sketch.buffer_) append(value);
+    for (const auto& item : sketch.heavy_) append(item.first);
+    std::sort(queries.begin(), queries.end());
+    queries.erase(std::unique(queries.begin(), queries.end()), queries.end());
+    // Both endpoints, and thus the midpoint, are step functions. Keys and
+    // neighbors exhaust the representable cells of their common partition;
+    // consecutive floating-point keys have no missing open cell to sample.
+    return queries;
   }
 };
 } // namespace splinesketch
+
+static std::size_t check_monotone_partition(const Sketch& sketch) {
+  const auto queries = splinesketch::PaperCertificateInspector::partition(sketch);
+  const auto uniform = certificate_midpoint_max_error(sketch);
+  const auto top = certificate_midpoint(sketch.count(), sketch.count());
+  std::uint64_t previous_lower = 0, previous_upper = 0;
+  double previous_estimate = 0;
+  for (double query : queries) {
+    const auto r = certificate_midpoint_rank(sketch, query);
+    require(previous_lower <= r.lower_rank && previous_upper <= r.upper_rank,
+            "certificate endpoint decreased");
+    require(previous_estimate <= r.estimate, "midpoint estimate decreased");
+    require(r.upper_rank <= sketch.count() && r.estimate <= top.estimate,
+            "midpoint exceeded terminal rank");
+    require(r.max_error <= uniform, "uniform bound excludes a certificate cell");
+    previous_lower = r.lower_rank; previous_upper = r.upper_rank; previous_estimate = r.estimate;
+  }
+  require(previous_lower == sketch.count() && previous_upper == sketch.count() &&
+          previous_estimate == top.estimate, "terminal rank not exact before conversion");
+  const auto bottom = certificate_midpoint_rank(sketch, -INFINITY);
+  require(bottom.lower_rank == 0 && bottom.upper_rank == 0 && bottom.estimate == 0,
+          "initial rank not zero");
+  // IEEE comparisons identify both signs of zero with the same breakpoint.
+  const auto negative_zero = certificate_midpoint_rank(sketch, -0.0);
+  const auto positive_zero = certificate_midpoint_rank(sketch, 0.0);
+  require(negative_zero.lower_rank == positive_zero.lower_rank &&
+          negative_zero.upper_rank == positive_zero.upper_rank &&
+          bits(negative_zero.estimate) == bits(positive_zero.estimate), "signed zero changed midpoint");
+  return queries.size();
+}
 
 static void arithmetic_checks() {
   for (std::uint64_t lower = 0; lower <= 64; ++lower)
@@ -60,12 +112,13 @@ static void arithmetic_checks() {
 
 struct Comparison {
   unsigned better = 0, equal = 0, worse = 0;
-  std::uint64_t queries = 0;
+  std::uint64_t queries = 0, partition_queries = 0;
 };
 
 static void check_state(const Sketch& sketch, std::vector<double> data, Comparison& comparison) {
   std::sort(data.begin(), data.end());
   require(sketch.count() == data.size(), "count changed by query adapter");
+  comparison.partition_queries += check_monotone_partition(sketch);
   std::vector<double> queries{-INFINITY, INFINITY};
   for (std::size_t i = 0; i < data.size(); ++i) {
     queries.push_back(data[i]);
@@ -73,7 +126,8 @@ static void check_state(const Sketch& sketch, std::vector<double> data, Comparis
     queries.push_back(std::nextafter(data[i], INFINITY));
     if (i) queries.push_back(data[i - 1] / 2 + data[i] / 2);
   }
-  splinesketch::PaperCertificateInspector::append_queries(sketch, queries);
+  const auto partition = splinesketch::PaperCertificateInspector::partition(sketch);
+  queries.insert(queries.end(), partition.begin(), partition.end());
   std::sort(queries.begin(), queries.end());
   queries.erase(std::unique(queries.begin(), queries.end()), queries.end());
   const auto uniform = certificate_midpoint_max_error(sketch);
@@ -105,14 +159,23 @@ static void check_state(const Sketch& sketch, std::vector<double> data, Comparis
 static void history_checks(bool theoretical, Comparison& comparison) {
   const auto policy = theoretical ? Sketch::BoundPolicy::theoretical : Sketch::BoundPolicy::practical;
   std::mt19937_64 random(223);
-  for (unsigned shape = 0; shape < 4; ++shape) {
+  for (unsigned shape = 0; shape < 7; ++shape) {
     Sketch sketch(16, policy);
     std::vector<double> data;
     check_state(sketch, data, comparison);
     for (unsigned i = 0; i < 149; ++i) {
-      const double value = shape == 0 ? static_cast<double>(random() % 17) - 8 :
-          shape == 1 ? std::ldexp(static_cast<double>(random() % 31), -20) :
-          shape == 2 ? static_cast<double>(i * i) : -static_cast<double>(i * i);
+      double value = 0;
+      switch (shape) {
+        case 0: value = static_cast<double>(random() % 17) - 8; break;
+        case 1: value = std::ldexp(static_cast<double>(random() % 31), -20); break;
+        case 2: value = static_cast<double>(i * i); break;
+        case 3: value = -static_cast<double>(i * i); break;
+        case 4: value = (static_cast<double>(random() % 17) - 8) *
+                           std::numeric_limits<double>::denorm_min(); break;
+        case 5: value = 1 + std::ldexp(static_cast<double>(random() % 17), -52); break;
+        case 6: value = (i % 2 ? -1 : 1) * (i % 11 == 0 ? std::numeric_limits<double>::max() :
+                           std::ldexp(1.0, static_cast<int>(random() % 2001) - 1000)); break;
+      }
       sketch.add(value); data.push_back(value);
       if (i % 29 == 0) check_state(sketch, data, comparison); // Include nonempty exact buffers.
     }
@@ -197,6 +260,7 @@ static void large_counts(bool emit) {
       zeros = 2 * zeros + (value == 0);
       count = 2 * count + 1;
       require(sketch.count() == count, "large public history count differs");
+      check_monotone_partition(sketch);
       if (step < 51) continue;
       for (int query : {-1, 0, 1}) {
         const auto truth = query < 0 ? 0 : query == 0 ? zeros : count;
@@ -225,7 +289,8 @@ int main(int argc, char** argv) {
   Comparison comparison;
   for (bool theoretical : {false, true}) history_checks(theoretical, comparison);
   require(comparison.queries > 10000, "missing history coverage");
-  std::cout << "{\"queries\":" << comparison.queries << ",\"checkpoints_better\":" << comparison.better
+  std::cout << "{\"queries\":" << comparison.queries << ",\"partition_queries\":" << comparison.partition_queries
+            << ",\"checkpoints_better\":" << comparison.better
             << ",\"checkpoints_equal\":" << comparison.equal << ",\"checkpoints_worse\":"
             << comparison.worse << "}\n";
 }

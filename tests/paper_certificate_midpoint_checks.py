@@ -93,16 +93,30 @@ def main():
     assert len(sys.argv) == 2, 'usage: midpoint-checks executable'
     executable = sys.argv[1]
     history = json.loads(subprocess.check_output([executable], text=True))
+    assert history['partition_queries'] > 10000, ('missing complete certificate partitions', history)
     cases = intervals()
     completed = subprocess.run([executable, '--intervals'], check=True, text=True, capture_output=True,
                                input=''.join(f'{lower} {upper}\n' for lower, upper in cases))
-    rows = completed.stdout.splitlines()
+    rows = [json.loads(line) for line in completed.stdout.splitlines()]
     assert len(rows) == len(cases), ('missing output', len(rows), len(cases))
-    for expected, line in zip(cases, rows):
-        check(json.loads(line), expected)
+    for expected, row in zip(cases, rows):
+        check(row, expected)
+    ordered_pairs = 0
+    for keys in (('lower', 'upper'), ('upper', 'lower')):
+        previous = None
+        for row in sorted(rows, key=lambda row: tuple(row[key] for key in keys)):
+            if previous is not None and previous['lower'] <= row['lower'] and previous['upper'] <= row['upper']:
+                for old_mode, new_mode in zip(previous['modes'], row['modes']):
+                    assert fraction(old_mode[0]) <= fraction(new_mode[0]), ('rounded midpoint decreased', previous, row)
+                ordered_pairs += 1
+            previous = row
+    assert ordered_pairs > 10000, ('missing ordered intervals', ordered_pairs)
     large_rows = [json.loads(line) for line in subprocess.check_output(
         [executable, '--large-counts'], text=True).splitlines()]
     assert len(large_rows) == 2 * 13 * 3
+    assert {(row['theoretical'], row['step'], row['query']) for row in large_rows} == {
+        (theory, step, query) for theory in (0, 1) for step in range(51, 64) for query in (-1, 0, 1)}
+    previous = None
     for row in large_rows:
         count = (1 << (row['step'] + 1)) - 1
         zeros = 1
@@ -117,6 +131,10 @@ def main():
         exact_radius = max(abs(estimate - row['lower']), abs(estimate - row['upper']))
         assert radius == ceiling(exact_radius), ('large radius', row)
         assert abs(estimate - truth) <= radius and abs(estimate - truth) <= uniform, ('large error bound', row)
+        if previous is not None and (row['theoretical'], row['step']) == (previous['theoretical'], previous['step']):
+            assert row['query'] > previous['query'] and estimate >= fraction(previous['estimate_bits']), (
+                'large public midpoint decreased', previous, row)
+        previous = row
     # Reachable endpoint witness: the certificate minimax radius is attained
     # by both streams, rather than merely by arbitrary real endpoints.
     truths = []
@@ -127,6 +145,7 @@ def main():
     assert truths == [1, 6]
     assert [abs(Fraction(7, 2) - truth) for truth in truths] == [Fraction(5, 2)] * 2
     print(json.dumps({'intervals': len(cases), 'rounding_modes': 4, 'history': history,
+                      'ordered_interval_pairs': ordered_pairs,
                       'large_count_queries': len(large_rows),
                       'reachable_minimax_radius': '5/2'}, sort_keys=True))
 

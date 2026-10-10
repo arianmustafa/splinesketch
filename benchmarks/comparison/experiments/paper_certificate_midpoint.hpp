@@ -88,6 +88,22 @@ inline CertificateMidpointEstimate certificate_midpoint(std::uint64_t lower, std
 // floating-point rounding mode. The returned radius is rounded upward exactly.
 // This is minimax over the certificate endpoints, not over a smaller feasible
 // rank set inferred from other sketch state, and not a pointwise accuracy claim.
+//
+// Monotonicity for CertifiedPaperSplineSketch: its ordered grid satisfies
+// L_i<=U_i, a_i>=0, L_i-L_(i-1)>=a_i, U_i-U_(i-1)>=a_i. At each interior
+// cut the envelope passes through gap [L_(i-1),U_i-a_i], knot [L_i,U_i], and
+// next gap [L_i,U_(i+1)-a_(i+1)] with neither endpoint decreasing. Below the
+// first cut it is [0,0]; at and above the last cut it is [U_last,U_last]. The
+// first knot also respects this order. Pending exact counts add the same
+// nondecreasing step function to both endpoints. Initialization from an
+// exact cumulative count, sampling with the source's exact atoms, adding
+// cumulative counts, summing merge sources, and deleting cuts preserve these
+// inequalities. Splits sample the frozen envelope, so induction covers them
+// too. Consequently M(x)=(L(x)+U(x))/2 is nondecreasing. Fixed nearest-even
+// binary64 rounding is nondecreasing (its ordered rounding cells cannot
+// reverse order); query-dependent choices between equally close tied values
+// would not suffice. Hence the returned midpoint is nondecreasing for all
+// ordered non-NaN queries, including adjacent keys and counts above 2^53.
 template<class CertifiedSketch>
 CertificateMidpointEstimate certificate_midpoint_rank(const CertifiedSketch& sketch, double query) {
   const auto bounds = sketch.rank_bounds(query);
