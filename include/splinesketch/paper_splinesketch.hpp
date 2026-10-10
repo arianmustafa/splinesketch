@@ -215,7 +215,13 @@ class BasicPaperSplineSketch {
     BasicPaperSplineSketch updated(*this);
     updated.consolidate_in_place();
     const auto old = updated.capacity_;
-    const bool reset_protection = (buckets > old ? buckets - old : old - buckets) > old / 4;
+    // A small shrink can also invalidate the practical extrema reserve.
+    // Treat that resize as a protection boundary before incorporating data.
+    const bool reserve_exhausted = policy_ == BoundPolicy::practical && buckets < old &&
+        static_cast<std::size_t>(std::count_if(updated.nodes_.begin(), updated.nodes_.end(),
+            [](const Node& node) { return node.protected_threshold; })) > buckets - 2;
+    const bool reset_protection = reserve_exhausted ||
+        (buckets > old ? buckets - old : old - buckets) > old / 4;
     if (reset_protection)
       updated.clear_protection();
     updated.capacity_ = buckets;
@@ -226,8 +232,7 @@ class BasicPaperSplineSketch {
     updated.shrink_heavy(released);
     updated.incorporate(released);
     updated.rebalance({}, false, buckets > old);
-    // Treat the large resize as an epoch boundary for the completed state;
-    // filling a much larger capacity must not protect every future join.
+    // Finish the protection boundary after refinement at the new capacity.
     if (reset_protection) updated.clear_protection();
     updated.trim_storage();
     *this = std::move(updated);
@@ -256,8 +261,12 @@ class BasicPaperSplineSketch {
     std::size_t at = 0;
     long double previous = 0;
     for (auto& node : result.nodes_) {
-      const long double value = spline_rank(nodes_, node.x) + spline_rank(other.nodes_, node.x);
-      node.mass = std::max(0.0L, value - previous);
+      // Rounded cubic samples can decrease at neighboring cuts. Carry the
+      // previous target forward so a later recovery does not add that dip
+      // again as mass. The last target still equals the two endpoint totals.
+      const long double value = std::max(previous,
+          spline_rank(nodes_, node.x) + spline_rank(other.nodes_, node.x));
+      node.mass = value - previous;
       if constexpr (TrackBounds) {
         const auto left = bucket_bounds(nodes_, node.x), right = bucket_bounds(other.nodes_, node.x);
         node.lower = left.lower + right.lower; node.upper = left.upper + right.upper;
@@ -602,12 +611,17 @@ class BasicPaperSplineSketch {
     } else {
       const auto total = before.sums.back();
       for (std::size_t i = 0; i < capacity_; ++i) {
-        const long double position = static_cast<long double>(i) * (total - 1) / (capacity_ - 1);
-        const auto rounded = std::floor(position + 0.5L);
-        // In binary64 arithmetic a UINT64_MAX-sized position can round to
-        // 2^64. Clamp before the integer conversion, and retain the maximum.
-        const auto offset = rounded >= static_cast<long double>(total - 1)
-            ? total - 1 : static_cast<std::uint64_t>(rounded);
+        // Rounded weighted positions can miss the maximum even in extended
+        // precision. Select both endpoints with exact integer offsets.
+        std::uint64_t offset = 0;
+        if (i == capacity_ - 1) offset = total - 1;
+        else if (i != 0) {
+          const long double position = static_cast<long double>(i) * (total - 1) / (capacity_ - 1);
+          const auto rounded = std::floor(position + 0.5L);
+          // Clamp before conversion: binary64 positions can round to 2^64.
+          offset = rounded >= static_cast<long double>(total - 1)
+              ? total - 1 : static_cast<std::uint64_t>(rounded);
+        }
         const auto at = std::upper_bound(before.sums.begin(), before.sums.end(), offset);
         const auto index = static_cast<std::size_t>(at - before.sums.begin());
         if (nodes_.empty() || nodes_.back().x != before.items[index].first)
@@ -699,7 +713,8 @@ class BasicPaperSplineSketch {
   }
   std::uint64_t occurrence_batch_limit() const {
     // floor(C_b*n/(2k)), saturated at n, without a widened integer type or
-    // floating-point count conversion. C_b is 1024 or an exact 3*2^j.
+    // floating-point count conversion. Initial 3/1024 factors remain exact
+    // integers after doubling or taking the maximum of merge inputs.
     const auto maximum = std::numeric_limits<std::uint64_t>::max();
     if (factor_ >= static_cast<long double>(maximum)) return std::max<std::uint64_t>(1, count_);
     const auto multiplier = static_cast<std::uint64_t>(factor_);
@@ -730,6 +745,17 @@ class BasicPaperSplineSketch {
     if (!i || i >= nodes_.size()) return false;
     const auto mid = midpoint(nodes_[i - 1].x, nodes_[i].x);
     return mid > nodes_[i - 1].x && mid < nodes_[i].x;
+  }
+  static std::size_t split_protections(const Node& left, const Node& right) {
+    return 1 + static_cast<std::size_t>(!left.protected_threshold) +
+        static_cast<std::size_t>(!right.protected_threshold);
+  }
+  bool protection_budget_allows(std::size_t protected_count,
+                               const Node& left, const Node& right) const {
+    // P <= k-2 reserves enough slack plus removable cuts for two new extrema,
+    // including when the grid has fewer than k nodes. Retain every old barrier.
+    return policy_ == BoundPolicy::theoretical ||
+        protected_count + split_protections(left, right) <= capacity_ - 2;
   }
   long double heuristic(std::size_t i, bool joined = false) const {
     const std::size_t right = i + static_cast<std::size_t>(joined);
@@ -774,13 +800,16 @@ class BasicPaperSplineSketch {
     // therefore contain exactly the first legal non-overlapping sorted join.
     return result;
   }
-  void raise_bound() {
+  void raise_bound(bool requires_removal) {
     if (policy_ == BoundPolicy::theoretical)
       throw std::logic_error("paper baseline cannot find a legal join");
     bool unprotected = false;
     for (std::size_t i = 1; i + 1 < nodes_.size(); ++i)
       unprotected |= !nodes_[i].protected_threshold;
-    if (!unprotected) throw std::logic_error("paper baseline has no unprotected join threshold");
+    // A full grid can stop needing a mandatory split after the bound rises.
+    // An oversized grid must still remove a cut, so protection can block it.
+    if (requires_removal && !unprotected)
+      throw std::logic_error("paper baseline has no unprotected join threshold");
     factor_ *= 2;
   }
   void join_at(std::size_t i) {
@@ -899,6 +928,7 @@ class BasicPaperSplineSketch {
     Heap masses{*this, mass_heap, {}}, splits{*this, split_heap, {}}, joins{*this, join_heap, {}};
     Id head = 0, tail, free = none;
     std::size_t size;
+    std::size_t protected_count = 0;
     bool growing;
 
     HeapRebalance(BasicPaperSplineSketch& s, const Snapshot& snapshot, bool grow)
@@ -911,6 +941,7 @@ class BasicPaperSplineSketch {
       masses.entries.reserve(slots); splits.entries.reserve(slots); joins.entries.reserve(slots);
       sketch.nodes_.reserve(slots);
       for (std::size_t i = 0; i < size; ++i) {
+        protected_count += static_cast<std::size_t>(sketch.nodes_[i].protected_threshold);
         links[i].prev = i ? static_cast<Id>(i - 1) : none;
         links[i].next = i + 1 < size ? static_cast<Id>(i + 1) : none;
       }
@@ -1020,6 +1051,7 @@ class BasicPaperSplineSketch {
         sketch.nodes_[id].atom = before->atom(mid);
       }
       sketch.nodes_[right].mass = high - value;
+      protected_count += split_protections(sketch.nodes_[left], sketch.nodes_[right]);
       sketch.nodes_[left].protected_threshold = sketch.nodes_[right].protected_threshold = true;
       links[id] = Links{}; links[id].prev = left; links[id].next = right;
       links[left].next = id; links[right].prev = id;
@@ -1035,14 +1067,15 @@ class BasicPaperSplineSketch {
       for (Id id : candidates) if (id != none && !overlaps(id, split_id)) return id;
       return none;
     }
-    void raise() {
+    void raise(bool requires_removal) {
       if (sketch.policy_ == BoundPolicy::theoretical)
         throw std::logic_error("paper baseline cannot find a legal join");
       bool unprotected = false;
       for (Id id = head; id != none; id = links[id].next)
         if (links[id].prev != none && links[id].next != none)
           unprotected |= !sketch.nodes_[id].protected_threshold;
-      if (!unprotected) throw std::logic_error("paper baseline has no unprotected join threshold");
+      if (requires_removal && !unprotected)
+        throw std::logic_error("paper baseline has no unprotected join threshold");
       sketch.factor_ *= 2;
       rebuild_heaps();
     }
@@ -1169,11 +1202,13 @@ class BasicPaperSplineSketch {
         if (!valid) throw std::logic_error("paper heap invariant failed");
       };
       std::size_t live = 0;
+      std::size_t protected_live = 0;
       Id previous = none;
       for (Id id = head; id != none; id = links[id].next) {
         require(id < links.size() && active(id) && links[id].prev == previous && !links[id].dirty);
         require(++live <= links.size());
         const auto& node = sketch.nodes_[id];
+        protected_live += static_cast<std::size_t>(node.protected_threshold);
         require(std::isfinite(node.mass) && node.mass >= 0);
         if (previous != none) require(sketch.nodes_[previous].x < node.x);
         require(node.prefix == (previous == none ? 0 : score(id, false)));
@@ -1184,6 +1219,7 @@ class BasicPaperSplineSketch {
         previous = id;
       }
       require(live == size && previous == tail);
+      require(protected_live == protected_count);
       for (const auto* heap : {&masses, &splits, &joins}) {
         for (std::size_t i = 0; i < heap->entries.size(); ++i) {
           const auto id = heap->entries[i];
@@ -1195,7 +1231,7 @@ class BasicPaperSplineSketch {
     }
     void run(bool materialize = true) {
       while (size > sketch.capacity_) {
-        if (joins.top() == none) { raise(); continue; }
+        if (joins.top() == none) { raise(true); continue; }
         join(joins.top());
         verify();
       }
@@ -1211,9 +1247,16 @@ class BasicPaperSplineSketch {
             best_gain(candidates, split_id, join_id);
         }
         if (split_id == none) break;
+        if (!sketch.protection_budget_allows(protected_count,
+                sketch.nodes_[links[split_id].prev], sketch.nodes_[split_id])) {
+          // Mandatory splits can be avoided by raising the practical bound.
+          // Optional refinement stops before consuming the extrema reserve.
+          if (!mandatory) break;
+          raise(false); continue;
+        }
         if (size < sketch.capacity_) { split(split_id); verify(); continue; }
         if (join_id == none) join_id = compatible(candidates, split_id);
-        if (join_id == none) { raise(); continue; }
+        if (join_id == none) { raise(false); continue; }
         join(join_id); split(split_id);
         verify();
       }
@@ -1265,9 +1308,12 @@ class BasicPaperSplineSketch {
     // Merge/resize/new extrema reduction: every join still obeys Definition 1.
     while (nodes_.size() > capacity_) {
       const auto joins = join_candidates();
-      if (!joins.count) { raise_bound(); continue; }
+      if (!joins.count) { raise_bound(true); continue; }
       join_at(joins.best.front().second);
     }
+    std::size_t protected_count = 0;
+    for (const auto& node : nodes_)
+      protected_count += static_cast<std::size_t>(node.protected_threshold);
     for (;;) {
       std::size_t split = npos;
       long double score = -1;
@@ -1301,13 +1347,21 @@ class BasicPaperSplineSketch {
         }
       }
       if (split == npos) break;
-      if (nodes_.size() < capacity_) { split_at(split, before); continue; }
+      if (!protection_budget_allows(protected_count, nodes_[split - 1], nodes_[split])) {
+        if (!mandatory) break;
+        raise_bound(false); continue;
+      }
+      const auto protections = split_protections(nodes_[split - 1], nodes_[split]);
+      if (nodes_.size() < capacity_) {
+        split_at(split, before); protected_count += protections; continue;
+      }
       if (join == npos) join = joins.nonoverlapping(split);
-      if (join == npos) { raise_bound(); continue; }
+      if (join == npos) { raise_bound(false); continue; }
       // Join first so vector capacity never needs more than k slots here.
       join_at(join);
       if (join < split) --split;
       split_at(split, before);
+      protected_count += protections;
     }
     // Edits read masses/prefixes and the frozen snapshot, never live slopes.
     // Restore slopes before another batch snapshot or public query uses them.
