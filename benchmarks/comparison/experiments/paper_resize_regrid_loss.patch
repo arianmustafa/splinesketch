@@ -1,0 +1,90 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -231,7 +231,11 @@
+     std::vector<Item> released;
+     updated.shrink_heavy(released);
+     updated.incorporate(released);
++    // Release exact heavy-hitter counts with ordinary batching before
++    // selecting certificate-aware joins for the data-free final regrid.
++    updated.rank_resize_ = true;
+     updated.rebalance({}, false, buckets > old);
++    updated.rank_resize_ = false;
+     // Finish the protection boundary after refinement at the new capacity.
+     if (reset_protection) updated.clear_protection();
+     updated.trim_storage();
+@@ -367,6 +371,8 @@
+   BoundPolicy policy_;
+   long double factor_;
+   bool finalized_ = false;
++  // Experimental; never active while incorporating incoming observations.
++  bool rank_resize_ = false;
+   std::vector<Node> nodes_;
+   std::vector<double> buffer_;
+   std::unordered_map<double, Heavy> heavy_;
+@@ -782,6 +788,20 @@
+       return npos;
+     }
+   };
++  bool better_join(const typename JoinCandidates::Candidate& a,
++                   const typename JoinCandidates::Candidate& b) const {
++    // Exact integer widening at the removed key; use the existing cheap
++    // curvature proxy for ties. Neither score predicts true rank error.
++    if constexpr (TrackBounds) if (rank_resize_) {
++      const auto width = [&](std::size_t i) {
++        return nodes_[i + 1].upper - nodes_[i + 1].atom - nodes_[i - 1].lower -
++               (nodes_[i].upper - nodes_[i].lower);
++      };
++      const auto x = width(a.second), y = width(b.second);
++      if (x != y) return x < y;
++    }
++    return a < b;
++  }
+   JoinCandidates join_candidates() const {
+     JoinCandidates result;
+     const auto limit = 0.75L * bound();
+@@ -790,7 +810,7 @@
+       ++result.count;
+       const typename JoinCandidates::Candidate candidate{heuristic(i, true), i};
+       for (std::size_t j = 0; j < result.best.size(); ++j)
+-        if (result.best[j].second == npos || candidate < result.best[j]) {
++        if (result.best[j].second == npos || better_join(candidate, result.best[j])) {
+           for (std::size_t at = result.best.size() - 1; at > j; --at) result.best[at] = result.best[at - 1];
+           result.best[j] = candidate;
+           break;
+@@ -858,6 +878,18 @@
+         return kind == mass_heap ? node.mass : kind == split_heap ? node.prefix : node.slope;
+       }
+       bool better(Id a, Id b) const {
++        if constexpr (TrackBounds) {
++          if (kind == join_heap && state.sketch.rank_resize_) {
++            const auto width = [&](Id id) {
++              const auto left = state.links[id].prev, right = state.links[id].next;
++              const auto& nodes = state.sketch.nodes_;
++              return nodes[right].upper - nodes[right].atom - nodes[left].lower -
++                     (nodes[id].upper - nodes[id].lower);
++            };
++            const auto x = width(a), y = width(b);
++            if (x != y) return x < y;
++          }
++        }
+         const auto x = key(a), y = key(b);
+         if (x != y) return kind == join_heap ? x < y : x > y;
+         return state.sketch.nodes_[a].x < state.sketch.nodes_[b].x;
+@@ -1243,7 +1275,7 @@
+         if (!mandatory) {
+           split_id = none;
+           if (growing) split_id = splits.top();
+-          else if (size == sketch.capacity_ && joins.entries.size() >= (sketch.capacity_ + 2) / 3 + 2)
++          else if (!(TrackBounds && sketch.rank_resize_) && size == sketch.capacity_ && joins.entries.size() >= (sketch.capacity_ + 2) / 3 + 2)
+             best_gain(candidates, split_id, join_id);
+         }
+         if (split_id == none) break;
+@@ -1332,7 +1364,7 @@
+             if (can_split(i) && nodes_[i].mass > 0 && heuristic(i) > score) {
+               split = i; score = heuristic(i);
+             }
+-        } else if (nodes_.size() == capacity_ && joins.count >= (capacity_ + 2) / 3 + 2) {
++        } else if (!(TrackBounds && rank_resize_) && nodes_.size() == capacity_ && joins.count >= (capacity_ + 2) / 3 + 2) {
+           long double gain = 0;
+           for (std::size_t i = 1; i < nodes_.size(); ++i) {
+             if (nodes_[i].mass <= 2 * static_cast<long double>(count_) / capacity_ || !can_split(i)) continue;

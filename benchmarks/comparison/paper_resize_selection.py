@@ -14,7 +14,10 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / 'benchmarks/comparison'
-PATCH = SOURCE / 'experiments/paper_resize_certificate_loss.patch'
+PATCHES = {
+    'sampled': SOURCE / 'experiments/paper_resize_certificate_loss.patch',
+    'regrid': SOURCE / 'experiments/paper_resize_regrid_loss.patch',
+}
 
 
 def run(command, **kwargs):
@@ -25,11 +28,12 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def summarize(path):
+def summarize(path, suite):
     with path.open(newline='') as stream:
         rows = list(csv.DictReader(stream))
     result = {}
-    for group, expected in [('fresh', 288), ('cluster_witness', 2), ('exact_discrete', 2), ('mixed', 6)]:
+    for group, expected in [(suite, 288), ('cluster_witness', 2), ('exact_discrete', 2),
+                            ('released_discrete', 2), ('mixed', 6)]:
         cases = [row for row in rows if row['group'] == group]
         if len(cases) != expected:
             raise RuntimeError(f'{group}: expected {expected} cases, got {len(cases)}')
@@ -52,19 +56,24 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--compiler', default='c++')
+    parser.add_argument('--variant', choices=PATCHES, default='regrid')
+    parser.add_argument('--suite', choices=('development', 'fresh'), default='fresh')
     args = parser.parse_args()
     compiler = shutil.which(args.compiler)
     if not compiler:
         parser.error('C++17 compiler required')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    patch = PATCHES[args.variant]
     sources = [ROOT / 'include/splinesketch' / name for name in ('splinesketch.hpp', 'paper_splinesketch.hpp')]
-    sources += [Path(__file__).resolve(), SOURCE / 'paper_resize_selection.cpp', PATCH,
+    sources += [Path(__file__).resolve(), SOURCE / 'paper_resize_selection.cpp', patch,
                 ROOT / 'tests/paper_resize_history_fixture.hpp']
     hashes = {str(path.relative_to(ROOT)): digest(path) for path in sources}
     version = subprocess.check_output([compiler, '--version'], text=True)
     verbose_version = subprocess.run([compiler, '-v'], capture_output=True, text=True, check=True).stderr
     flags = ['-std=c++17', '-O2']
+    if args.variant == 'regrid':
+        flags.append('-DSPLINESKETCH_RESIZE_REGRID_ONLY')
     modes = [('native-scanner', []), ('native-heap', ['-DSPLINESKETCH_PAPER_FORCE_HEAPS',
                                                   '-DSPLINESKETCH_VERIFY_PAPER_HEAPS'])]
     if platform.machine() == 'x86_64' and 'gcc version' in verbose_version:
@@ -73,9 +82,11 @@ def main():
     metadata = {
         'timestamp_utc': datetime.datetime.now(datetime.timezone.utc).isoformat(),
         'compiler': version, 'flags': flags, 'platform': platform.platform(), 'source_sha256': hashes,
-        'fresh_seeds': [113, 127, 149], 'fresh_shapes': list(range(8)), 'capacities': [16, 32, 64],
+        'variant': args.variant, 'suite': args.suite, 'development_seeds': [113, 127, 149],
+        'fresh_seeds': [179, 191, 211], 'shapes': list(range(8)), 'capacities': [16, 32, 64],
         'resize_operations_per_case': 24, 'mixed_seed': 163,
-        'historical_cases': ['124-input resize fixture', '269-input discrete stream, seed 97'],
+        'historical_cases': ['124-input resize fixture', '269-input discrete stream, seed 97',
+                             '141-input discrete stream with heavy-hitter releases, seed 113'],
         'queries': 'input keys and neighbours, quarterpoints, union of both grids and neighbours, infinities',
         'timing': 'exploratory single measurements; reference first; heap modes include invariant verification',
         'proof_scope': 'local integer width identity and finite certificate checks; no capacity-only rate',
@@ -88,7 +99,7 @@ def main():
             headers.mkdir(parents=True)
             for source in sources[:2]:
                 shutil.copyfile(source, headers / source.name)
-        run(['patch', '--batch', '-p1', '-i', PATCH], cwd=build / 'candidate')
+        run(['patch', '--batch', '-p1', '-i', patch], cwd=build / 'candidate')
         reference = build / 'reference/include/splinesketch'
         # GCC may deduplicate byte-identical pragma-once files. Both namespaces
         # must have their own core definition for this paired comparison.
@@ -104,16 +115,15 @@ def main():
                  SOURCE / 'paper_resize_selection.cpp', '-o', executable])
             path = output / f'{mode}.csv'
             with path.open('w') as stream:
-                run([executable], stdout=stream)
-            metadata['summaries'][mode], paired_rows[mode] = summarize(path)
-            print(mode, metadata['summaries'][mode]['fresh']['final_measured_error'], flush=True)
+                run([executable, *(['--fresh'] if args.suite == 'fresh' else [])], stdout=stream)
+            metadata['summaries'][mode], paired_rows[mode] = summarize(path, args.suite)
+            print(mode, metadata['summaries'][mode][args.suite]['final_measured_error'], flush=True)
         # Native scanner and verified heaps must agree on all deterministic
         # results, including common query sets. Timing naturally differs.
         scanner, heap = paired_rows['native-scanner'], paired_rows['native-heap']
-        if len(scanner) != len(heap) or any(
-                a != {key: row[key] for key in a}
-                for a, row in zip([{key: value for key, value in row.items() if not key.endswith('_ns')}
-                                   for row in scanner], heap)):
+        comparable = lambda rows: [{key: value for key, value in row.items() if not key.endswith('_ns')}
+                                   for row in rows]
+        if comparable(scanner) != comparable(heap):
             raise RuntimeError('native scanner and heap disagree')
     if hashes != {str(path.relative_to(ROOT)): digest(path) for path in sources}:
         raise RuntimeError('sources changed during experiment')

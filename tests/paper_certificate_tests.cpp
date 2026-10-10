@@ -354,6 +354,44 @@ static void exact_discrete_capacity_changes() {
   }
 }
 
+static void released_discrete_capacity_changes() {
+  // Shrinking the heavy-hitter table releases exact counts before regridding.
+  // A resize score applied during that incorporation raised measured error
+  // above 14 here. Keep the existing practical replay below eight ranks.
+  Certified sketch(16);
+  Paper raw(16);
+  std::mt19937_64 random(113);
+  std::map<double, std::uint64_t> truth;
+  for (unsigned i = 0; i < 141; ++i) {
+    const double value = static_cast<double>(random() % 17) - 8;
+    sketch.add(value); raw.add(value); ++truth[value];
+  }
+  sketch.consolidate(); raw.consolidate();
+  const auto held = sketch.heavy_hitter_count();
+  std::vector<double> xs;
+  for (int key = -8; key <= 8; ++key) {
+    xs.push_back(key);
+    xs.push_back(std::nextafter(static_cast<double>(key), -INFINITY));
+    xs.push_back(std::nextafter(static_cast<double>(key), INFINITY));
+    if (key < 8) for (unsigned j = 1; j < 4; ++j) xs.push_back(key + j / 4.0);
+  }
+  const auto verify = [&] {
+    assert(sketch.count() == 141 && raw.count() == 141);
+    for (double x : xs) {
+      std::uint64_t exact = 0;
+      for (const auto& item : truth) if (item.first <= x) exact += item.second;
+      assert(std::fabs(sketch.rank(x) - static_cast<double>(exact)) <= 8);
+    }
+    queries(sketch, truth, &raw);
+  };
+  verify();
+  for (unsigned i = 0; i < 24; ++i) {
+    sketch.resize(i % 2 ? 16 : 8); raw.resize(i % 2 ? 16 : 8);
+    if (!i) assert(sketch.heavy_hitter_count() < held);
+    verify();
+  }
+}
+
 static void large_counts() {
   Certified sketch(6), power(6);
   power.add(0);
@@ -518,6 +556,7 @@ int main() {
   capacity_growth_preserves_certificates();
   repeated_capacity_changes();
   exact_discrete_capacity_changes();
+  released_discrete_capacity_changes();
   for (auto policy : {Paper::BoundPolicy::practical, Paper::BoundPolicy::theoretical}) {
     protected_grid_updates<Paper>(policy);
     shrink_extrema_reserve<Paper>(policy);

@@ -21,10 +21,16 @@ static void require(bool condition, const char* message) {
 // Check the local integer loss formula independently at the removed key and
 // its two old gaps. The removed key attains the maximum width increase:
 // (L_i-L_left)+(U_right-atom_right-U_i). No true-rank error claim follows.
-#define DEFINE_INSPECTOR(NS) \
+#ifdef SPLINESKETCH_RESIZE_REGRID_ONLY
+#define CHECK_REGRID_FLAG(s) require(!(s).rank_resize_, "resize flag escaped regrid")
+#else
+#define CHECK_REGRID_FLAG(s) ((void)0)
+#endif
+#define DEFINE_INSPECTOR(NS, CHECK_FLAG) \
 namespace NS { \
 struct PaperCertificateInspector { \
   static std::vector<double> queries(const CertifiedPaperSplineSketch& s) { \
+    CHECK_FLAG; \
     std::vector<double> result; \
     for (std::size_t i = 0; i < s.nodes_.size(); ++i) { \
       const auto& node = s.nodes_[i]; \
@@ -54,9 +60,10 @@ struct PaperCertificateInspector { \
   } \
 }; \
 }
-DEFINE_INSPECTOR(splinesketch)
-DEFINE_INSPECTOR(previous_splinesketch)
+DEFINE_INSPECTOR(splinesketch, CHECK_REGRID_FLAG(s))
+DEFINE_INSPECTOR(previous_splinesketch, (void)0)
 #undef DEFINE_INSPECTOR
+#undef CHECK_REGRID_FLAG
 
 using Before = previous_splinesketch::CertifiedPaperSplineSketch;
 using After = splinesketch::CertifiedPaperSplineSketch;
@@ -86,10 +93,13 @@ static std::vector<double> input(unsigned shape, unsigned seed, unsigned k) {
   return values;
 }
 
-struct Metrics { double before = 0, after = 0; std::size_t queries = 0; };
+struct Metrics {
+  double before = 0, after = 0, before_query = 0, after_query = 0;
+  std::size_t queries = 0;
+};
 static Metrics evaluate(const Before& before, const After& after,
                         const BeforePlain& plain_before, const AfterPlain& plain_after,
-                        std::vector<double> data) {
+                        std::vector<double> data, bool identical = false) {
   std::sort(data.begin(), data.end());
   auto keys = data;
   keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
@@ -121,8 +131,15 @@ static Metrics evaluate(const Before& before, const After& after,
       require(error <= r.max_error && error <= bound, "error allowance too small");
       return error;
     };
-    result.before = std::max(result.before, check(before, before_bound));
-    result.after = std::max(result.after, check(after, after_bound));
+    const auto before_error = check(before, before_bound), after_error = check(after, after_bound);
+    if (before_error > result.before) { result.before = before_error; result.before_query = x; }
+    if (after_error > result.after) { result.after = after_error; result.after_query = x; }
+    if (identical) {
+      const auto a = before.rank_with_error(x);
+      const auto b = after.rank_with_error(x);
+      require(a.estimate == b.estimate && a.lower_rank == b.lower_rank && a.upper_rank == b.upper_rank &&
+              a.max_error == b.max_error, "candidate changed initial query result");
+    }
     require(plain_before.rank(x) == plain_after.rank(x), "plain alias changed");
   }
   for (const auto count : {before.count(), after.count(), plain_before.count(), plain_after.count()})
@@ -137,11 +154,19 @@ template<class S> static S replay(const std::vector<double>& data, unsigned k, b
   return s;
 }
 
+static std::size_t check_finalize(Before before, After after, BeforePlain plain_before,
+                                 AfterPlain plain_after, const std::vector<double>& data, bool identical) {
+  before.finalize(); after.finalize(); plain_before.finalize(); plain_after.finalize();
+  require(before.finalized() && after.finalized() && plain_before.finalized() && plain_after.finalized(),
+          "finalization failed");
+  return evaluate(before, after, plain_before, plain_after, data, identical).queries;
+}
+
 static void compare(const std::string& group, unsigned shape, unsigned seed, unsigned k,
                     bool theory, bool shrink, std::vector<double> data, bool mixed = false) {
   auto before = replay<Before>(data, k, theory); auto after = replay<After>(data, k, theory);
   auto plain_before = replay<BeforePlain>(data, k, theory); auto plain_after = replay<AfterPlain>(data, k, theory);
-  const auto initial = evaluate(before, after, plain_before, plain_after, data);
+  const auto initial = evaluate(before, after, plain_before, plain_after, data, true);
   require(initial.before == initial.after && before.max_rank_uncertainty() == after.max_rank_uncertainty(),
           "candidate changed initial streaming");
   const auto initial_bound = before.max_rank_error();
@@ -150,7 +175,7 @@ static void compare(const std::string& group, unsigned shape, unsigned seed, uns
   Metrics final = initial;
   double before_ns = 0, after_ns = 0;
   unsigned worse_steps = 0;
-  std::size_t query_count = initial.queries;
+  std::size_t query_count = initial.queries + check_finalize(before, after, plain_before, plain_after, data, true);
   for (unsigned step = 0; step < 24; ++step) {
     const auto capacity = step % 2 ? k : shrink ? k / 2 : 2 * k;
     auto start = std::chrono::steady_clock::now(); before.resize(capacity);
@@ -158,6 +183,9 @@ static void compare(const std::string& group, unsigned shape, unsigned seed, uns
     start = std::chrono::steady_clock::now(); after.resize(capacity);
     after_ns += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
     plain_before.resize(capacity); plain_after.resize(capacity);
+    require(before.bucket_capacity() == capacity && after.bucket_capacity() == capacity &&
+            plain_before.bucket_capacity() == capacity && plain_after.bucket_capacity() == capacity,
+            "capacity change failed");
     if (mixed && step % 4 == 3) {
       const auto extra = input(shape, seed + step, 4);
       if (step % 8 == 3) {
@@ -173,33 +201,47 @@ static void compare(const std::string& group, unsigned shape, unsigned seed, uns
     worse_steps += final.after > final.before;
     if (group == "exact_discrete")
       require(after.max_rank_uncertainty() == 0 && final.after == 0, "exact discrete resize regressed");
+#ifdef SPLINESKETCH_RESIZE_REGRID_ONLY
+    // The original sampled prototype exceeds 14 at the first shrink. The
+    // scoped candidate keeps this entire practical replay below eight.
+    if (group == "released_discrete" && !theory)
+      require(final.after <= 8 && after.max_rank_uncertainty() <= 16,
+              "released discrete resize regressed");
+#endif
     if (group == "cluster_witness") {
       const auto r = after.rank_with_error(paper_test::resize_history_query);
       require(r.lower_rank == 4 && r.upper_rank == 9 && r.estimate == 9, "cluster witness regressed");
     }
   }
+  query_count += check_finalize(before, after, plain_before, plain_after, data, false);
   std::cout << group << ',' << shape << ',' << seed << ',' << k << ',' << theory << ',' << shrink << ','
             << data.size() << ',' << hash << ',' << query_count << ',' << initial.before << ',' << initial_bound
             << ',' << final.before << ',' << final.after << ',' << before.max_rank_error() << ','
             << after.max_rank_error() << ',' << before.max_rank_uncertainty() << ',' << after.max_rank_uncertainty()
-            << ',' << worse_steps << ',' << before_ns / 24 << ',' << after_ns / 24 << '\n' << std::flush;
+            << ',' << worse_steps << ',' << before_ns / 24 << ',' << after_ns / 24 << ','
+            << final.before_query << ',' << final.after_query << '\n' << std::flush;
 }
 
-int main() {
+int main(int argc, char** argv) {
+  const bool fresh = argc == 2 && std::string(argv[1]) == "--fresh";
+  require(argc == 1 || fresh, "usage: paired [--fresh]");
   std::cout << std::setprecision(17)
             << "group,shape,seed,k,theoretical,shrink,n,input_hash,queries,initial_error,initial_bound,"
                "before_error,after_error,before_bound,after_bound,before_width,after_width,worse_steps,"
-               "before_resize_ns,after_resize_ns\n";
-  // Declared before observing candidate results. Historical seeds 71/83/97
-  // remain development data; these three seeds supply a separate comparison.
+               "before_resize_ns,after_resize_ns,before_query,after_query\n";
+  // Seeds 113/127/149 informed the narrower scope and are now development
+  // data. The fresh seeds were chosen before observing the scoped candidate.
+  const auto seeds = fresh ? std::array<unsigned, 3>{179, 191, 211} : std::array<unsigned, 3>{113, 127, 149};
   for (unsigned k : {16, 32, 64}) for (unsigned shape = 0; shape < 8; ++shape)
-    for (unsigned seed : {113, 127, 149}) for (bool theory : {false, true}) for (bool shrink : {false, true})
-      compare("fresh", shape, seed, k, theory, shrink, input(shape, seed, k));
+    for (unsigned seed : seeds) for (bool theory : {false, true}) for (bool shrink : {false, true})
+      compare(fresh ? "fresh" : "development", shape, seed, k, theory, shrink, input(shape, seed, k));
   for (bool theory : {false, true}) {
     compare("exact_discrete", 2, 97, 32, theory, true, input(2, 97, 32));
+    compare("released_discrete", 2, 113, 16, theory, true, input(2, 113, 16));
     compare("cluster_witness", 1, 0, 16, theory, false,
             {paper_test::resize_history_input.begin(), paper_test::resize_history_input.end()});
     for (unsigned shape = 0; shape < 3; ++shape)
       compare("mixed", shape, 163, 32, theory, true, input(shape, 163, 32), true);
   }
+  return 0;
 }
