@@ -62,6 +62,20 @@ if(SPLINESKETCH_BUILD_TESTS)
   target_compile_definitions(splinesketch_paper_numeric_tests PRIVATE SPLINESKETCH_TESTING)
   add_test(NAME splinesketch_paper_numeric_tests COMMAND splinesketch_paper_numeric_tests)
   find_package(Python3 QUIET COMPONENTS Interpreter)
+  function(add_paper_resize_information_test target)
+    add_executable(${target} tests/paper_resize_information_tests.cpp)
+    target_link_libraries(${target} PRIVATE splinesketch)
+    target_compile_definitions(${target} PRIVATE SPLINESKETCH_TESTING ${ARGN})
+    if(Python3_Interpreter_FOUND)
+      add_test(NAME ${target} COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/paper_resize_information_checks.py $<TARGET_FILE:${target}>)
+    else()
+      add_test(NAME ${target} COMMAND ${target})
+    endif()
+  endfunction()
+  add_paper_resize_information_test(splinesketch_paper_resize_information_tests)
+  add_paper_resize_information_test(splinesketch_paper_resize_information_heap_tests
+    SPLINESKETCH_PAPER_FORCE_HEAPS SPLINESKETCH_VERIFY_PAPER_HEAPS)
   if(Python3_Interpreter_FOUND)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
       add_test(NAME splinesketch_paper_local_charge_scan_checks COMMAND ${Python3_EXECUTABLE}
@@ -111,6 +125,9 @@ if(SPLINESKETCH_BUILD_TESTS)
   target_compile_definitions(splinesketch_guarantee_obligation_tests PRIVATE SPLINESKETCH_VERIFY_GUARANTEES)
   add_test(NAME splinesketch_guarantee_obligation_tests COMMAND splinesketch_guarantee_obligation_tests)
   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+    add_paper_resize_information_test(splinesketch_paper_resize_information_binary64_tests
+      SPLINESKETCH_PAPER_FORCE_HEAPS SPLINESKETCH_VERIFY_PAPER_HEAPS)
+    target_compile_options(splinesketch_paper_resize_information_binary64_tests PRIVATE -mlong-double-64)
     if(Python3_Interpreter_FOUND)
       add_test(NAME splinesketch_paper_local_charge_binary64_checks COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/paper_local_charge_checks.py
