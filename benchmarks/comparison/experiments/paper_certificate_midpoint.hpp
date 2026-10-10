@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <stdexcept>
 
@@ -21,6 +22,7 @@ static_assert(std::numeric_limits<double>::is_iec559 &&
               std::numeric_limits<double>::radix == 2 &&
               std::numeric_limits<double>::digits == 53,
               "certificate midpoint requires IEEE binary64");
+static_assert(sizeof(double) == sizeof(std::uint64_t), "binary64 storage required");
 
 inline unsigned integer_shift(std::uint64_t value) noexcept {
   // At most 11 discarded bits for uint64_t. The remaining significand is
@@ -53,6 +55,28 @@ inline double distance(double estimate, std::uint64_t endpoint) noexcept {
   // endpoint above must be handled before the uint64_t conversion.
   const auto integer = static_cast<std::uint64_t>(estimate);
   return integer_ceiling(integer >= endpoint ? integer - endpoint : endpoint - integer);
+}
+
+inline std::uint64_t ordered_bits(double value) noexcept {
+  std::uint64_t bits;
+  std::memcpy(&bits, &value, sizeof bits);
+  constexpr auto sign = std::uint64_t{1} << 63;
+  return bits & sign ? ~bits : bits ^ sign;
+}
+
+inline double from_ordered_bits(std::uint64_t ordered) noexcept {
+  constexpr auto sign = std::uint64_t{1} << 63;
+  const auto bits = ordered & sign ? ordered ^ sign : ~ordered;
+  double value;
+  std::memcpy(&value, &bits, sizeof value);
+  return value;
+}
+
+inline bool reaches(std::uint64_t lower, std::uint64_t upper, std::uint64_t target) noexcept {
+  // Equivalent to (lower+upper)/2 >= target, without overflowing either sum
+  // or converting integer ranks to floating point. Bounds must be ordered.
+  if (lower >= target) return true;
+  return upper >= target && target - lower <= upper - target;
 }
 } // namespace midpoint_detail
 
@@ -127,6 +151,40 @@ inline double certificate_midpoint_uniform_error(std::uint64_t width, std::uint6
 template<class CertifiedSketch>
 double certificate_midpoint_max_error(const CertifiedSketch& sketch) {
   return certificate_midpoint_uniform_error(sketch.max_rank_uncertainty(), sketch.count());
+}
+
+// Integer-rank quantile experiment. Invert the exact midpoint M=(L+U)/2,
+// rather than its rounded display value: for some counts above 2^53 the
+// displayed terminal rank rounds below count, making target=count unreachable.
+// Targets are 1..count, with no floating-point q*count conversion. Return the
+// first finite binary64 value in numerical order with M(x)>=target; zero is
+// canonicalized to +0. This need not be an observed value.
+//
+// Proof for the certified paper envelopes: reaches(x) is monotone. At DBL_MAX the
+// bounds equal count, so the high endpoint is feasible. Binary search preserves
+// the first feasible point in [low,high] and terminates in at most 64 steps.
+// Signed zeros have the same bounds. For p=nextafter(x,-infinity), M(p)<target
+// and M(x)>=target, including x=-DBL_MAX, whose predecessor is -infinity.
+// If W is max_rank_uncertainty and R is the true inclusive rank, the integer
+// certificates give R(x)>=target-W/2 and R(p)<target+W/2. Thus the distance of
+// target from the closed rank bracket [R(p),R(x)] is at most floor(W/2), since
+// this distance is an integer. Duplicate atoms can make |R(x)-target| as
+// large as count-target, even when W=0. No binary64 rank-return allowance is
+// needed for this integer predicate.
+template<class CertifiedSketch>
+double certificate_midpoint_select(const CertifiedSketch& sketch, std::uint64_t target) {
+  if (!sketch.count()) throw std::logic_error("selection from empty sketch");
+  if (!target || target > sketch.count()) throw std::invalid_argument("rank target must be in [1,count]");
+  auto low = midpoint_detail::ordered_bits(-std::numeric_limits<double>::max());
+  auto high = midpoint_detail::ordered_bits(std::numeric_limits<double>::max());
+  while (low < high) {
+    const auto middle = low + (high - low) / 2;
+    const auto bounds = sketch.rank_bounds(midpoint_detail::from_ordered_bits(middle));
+    if (midpoint_detail::reaches(bounds.lower, bounds.upper, target)) high = middle;
+    else low = middle + 1;
+  }
+  const auto value = midpoint_detail::from_ordered_bits(low);
+  return value == 0 ? 0.0 : value;
 }
 
 } // namespace splinesketch::experimental
