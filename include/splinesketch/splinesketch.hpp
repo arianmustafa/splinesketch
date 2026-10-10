@@ -15,6 +15,46 @@
 
 namespace splinesketch {
 
+namespace detail {
+// Exact ceil(q*n) for a binary64 q in [0,1] and a uint64 count. Splitting
+// the significand product into two words avoids both widened integer types
+// and floating-point rounding of the count or the product near an integer.
+inline std::uint64_t quantile_rank_target(double q, std::uint64_t count) noexcept {
+  if (q == 0 || !count) return 0;
+  if (q == 1) return count;
+  int exponent;
+  const auto significand = static_cast<std::uint64_t>(std::ldexp(std::frexp(q, &exponent), 53));
+  constexpr std::uint64_t mask = 0xffffffffULL;
+  const auto a0 = count & mask, a1 = count >> 32;
+  const auto b0 = significand & mask, b1 = significand >> 32;
+  const auto w0 = a0 * b0;
+  const auto t = a1 * b0 + (w0 >> 32);
+  const auto w1 = (t & mask) + a0 * b1;
+  const auto high = a1 * b1 + (t >> 32) + (w1 >> 32);
+  const auto low = (w1 << 32) | (w0 & mask);
+  const auto shift = static_cast<unsigned>(53 - exponent);
+  // A positive subnormal can have a denominator far larger than 2^128.
+  // Its positive product is then less than one, so its ceiling is one.
+  if (shift >= 128) return 1;
+  if (shift > 64) {
+    const auto upper_shift = shift - 64;
+    return (high >> upper_shift) +
+        (low != 0 || (high & ((std::uint64_t{1} << upper_shift) - 1)) != 0);
+  }
+  if (shift == 64) return high + (low != 0);
+  return ((high << (64 - shift)) | (low >> shift)) +
+      ((low & ((std::uint64_t{1} << shift) - 1)) != 0);
+}
+
+// Compare a nonnegative finite rank display with an exact integer target.
+// Truncation preserves >= an integer, whereas converting the target can
+// round it in either direction. Handle the rounded uint64 ceiling first.
+inline bool rank_reaches_target(double rank, std::uint64_t target) noexcept {
+  if (rank >= 0x1p64) return true;
+  return rank >= 0 && static_cast<std::uint64_t>(rank) >= target;
+}
+} // namespace detail
+
 // A buffered SplineSketch for finite doubles. rank(x) estimates the number of
 // inserted values <= x. Heavy hitters are held exactly in a Misra-Gries table.
 // The implementation follows Sections 3 and 4 of arXiv:2504.01206v3.
@@ -122,7 +162,7 @@ class SplineSketch {
     if (q == 0) return lo;
     if (q == 1) return hi;
     if (lo == hi) return lo;
-    const long double target = std::ceil(q * static_cast<long double>(count_));
+    const auto target = detail::quantile_rank_target(q, count_);
     // Preparing exact-value prefix counts pays off across the inverse search,
     // but keep small tables allocation-free. All scratch storage is local so
     // const queries do not mutate the sketch or introduce a shared cache.
@@ -143,12 +183,12 @@ class SplineSketch {
              std::numeric_limits<long double>::epsilon() +
          std::numeric_limits<double>::epsilon());
     const auto reaches_target = [&](double value) {
-      if (!prepare_exact) return rank(value) >= target;
+      if (!prepare_exact) return detail::rank_reaches_target(rank(value), target);
       const long double estimate = spline_rank(nodes_, value) + exact.rank(value);
       if (std::fabs(estimate - target) <= rounding_slack)
-        return rank(value) >= target;
-      return static_cast<double>(std::clamp(estimate, 0.0L,
-          static_cast<long double>(count_))) >= target;
+        return detail::rank_reaches_target(rank(value), target);
+      return detail::rank_reaches_target(static_cast<double>(std::clamp(estimate, 0.0L,
+          static_cast<long double>(count_))), target);
     };
     // Binary search the ordered IEEE-754 bit pattern. This also works when
     // the endpoints are 1e308 apart or only one ULP apart.

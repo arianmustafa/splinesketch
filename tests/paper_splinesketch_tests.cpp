@@ -1,8 +1,10 @@
 #include <splinesketch/paper_splinesketch.hpp>
+#include <splinesketch/certified_splinesketch.hpp>
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
 #include <cassert>
+#include <cfenv>
 #include <iostream>
 #include <map>
 #include <random>
@@ -106,6 +108,134 @@ struct PaperSplineSketchInspector {
 using Sketch = splinesketch::PaperSplineSketch;
 using Inspect = splinesketch::PaperSplineSketchInspector;
 
+static std::uint64_t reference_target(double q, std::uint64_t count) {
+#ifdef __SIZEOF_INT128__
+  // Independent oracle: decode the binary64 bits and multiply directly in
+  // 128 bits, rather than using frexp and the production word products.
+  std::uint64_t bits;
+  std::memcpy(&bits, &q, sizeof bits);
+  const auto exponent = static_cast<unsigned>(bits >> 52);
+  const auto significand = (bits & ((std::uint64_t{1} << 52) - 1)) |
+      (exponent ? std::uint64_t{1} << 52 : 0);
+  const auto product = static_cast<__uint128_t>(count) * significand;
+  const auto shift = exponent ? 1075 - exponent : 1074;
+  if (shift >= 128) return product != 0;
+  return static_cast<std::uint64_t>((product >> shift) +
+      ((product & ((static_cast<__uint128_t>(1) << shift) - 1)) != 0));
+#else
+  return splinesketch::detail::quantile_rank_target(q, count);
+#endif
+}
+
+static void exact_quantile_arithmetic() {
+  using splinesketch::detail::quantile_rank_target;
+  using splinesketch::detail::rank_reaches_target;
+  const auto maximum = std::numeric_limits<std::uint64_t>::max();
+  std::vector<std::pair<double, std::uint64_t>> cases;
+  for (std::uint64_t count : {std::uint64_t{0}, std::uint64_t{1}, std::uint64_t{5},
+                            std::uint64_t{10}, maximum}) {
+    for (double q : {0., 0.1, 0.5, std::nextafter(1., 0.), 1.,
+                    std::numeric_limits<double>::denorm_min()}) cases.emplace_back(q, count);
+  }
+  for (unsigned bit = 0; bit < 64; ++bit) {
+    const auto power = std::uint64_t{1} << bit;
+    for (auto count : {power - 1, power, power + 1})
+      for (double q : {0.1, 0.2, std::nextafter(0.5, 0.), 0.5, std::nextafter(0.5, 1.),
+                      std::nextafter(1., 0.)}) cases.emplace_back(q, count);
+  }
+  // Every normal denominator exponent and nearby subnormal boundaries.
+  for (unsigned exponent = 0; exponent < 1023; ++exponent) {
+    for (std::uint64_t fraction : {std::uint64_t{0}, std::uint64_t{1},
+                                  (std::uint64_t{1} << 52) - 1}) {
+      const auto bits = (static_cast<std::uint64_t>(exponent) << 52) | fraction;
+      double q;
+      std::memcpy(&q, &bits, sizeof q);
+      cases.emplace_back(q, maximum);
+    }
+  }
+  std::mt19937_64 random(0x5155414e54494c45ULL);
+  for (unsigned i = 0; i < 10000; ++i) {
+    const auto bits = random() % 0x3ff0000000000001ULL;
+    double q;
+    std::memcpy(&q, &bits, sizeof q);
+    cases.emplace_back(q, random());
+  }
+  const auto old_mode = std::fegetround();
+  for (auto mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+    assert(std::fesetround(mode) == 0);
+    for (auto input : cases)
+      assert(quantile_rank_target(input.first, input.second) == reference_target(input.first, input.second));
+    assert(quantile_rank_target(0.1, 10) == 2); // Exact binary64 0.1 exceeds 1/10.
+    assert(quantile_rank_target(0.5, (std::uint64_t{1} << 53) + 1) == (std::uint64_t{1} << 52) + 1);
+    assert(quantile_rank_target(std::numeric_limits<double>::denorm_min(), maximum) == 1);
+    assert(quantile_rank_target(1, maximum) == maximum);
+    assert(!rank_reaches_target(0x1p53, (std::uint64_t{1} << 53) + 1));
+    assert(rank_reaches_target(0x1p53 + 2, (std::uint64_t{1} << 53) + 1));
+    assert(rank_reaches_target(0x1p64, maximum));
+    assert(!rank_reaches_target(std::nextafter(0x1p64, 0.), maximum));
+    assert(rank_reaches_target(0.5, 0) && !rank_reaches_target(0.5, 1));
+  }
+  assert(std::fesetround(old_mode) == 0);
+}
+
+template<class S>
+static void large_count_median(S zeros, S ones, unsigned exponent,
+                               unsigned extra_zeros, unsigned extra_ones, double expected,
+                               bool prepare_exact = false) {
+  zeros.add(0); ones.add(1);
+  for (unsigned i = 0; i < exponent; ++i) {
+    zeros.merge(zeros); ones.merge(ones);
+  }
+  for (unsigned i = 0; i < extra_zeros; ++i) zeros.add(0);
+  for (unsigned i = 0; i < extra_ones; ++i) ones.add(1);
+  zeros.merge(ones);
+  assert(zeros.count() == (std::uint64_t{1} << (exponent + 1)) + extra_zeros + extra_ones);
+  assert(zeros.quantile(0.5) == expected);
+  if (prepare_exact) {
+    // More than 16 distinct exact values exercises the prepared-prefix
+    // search as well. Equal additions on either side preserve the median.
+    for (unsigned i = 0; i < 16; ++i) {
+      zeros.add(-1. - i); zeros.add(2. + i);
+    }
+    assert(zeros.quantile(0.5) == expected);
+  }
+  zeros.consolidate();
+  assert(zeros.quantile(0.5) == expected);
+  if constexpr (std::is_same_v<S, splinesketch::PaperSplineSketch> ||
+                std::is_same_v<S, splinesketch::CertifiedPaperSplineSketch>) {
+    zeros.finalize();
+    assert(zeros.quantile(0.5) == expected);
+  }
+}
+
+static void large_count_quantiles() {
+  using Core = splinesketch::SplineSketch;
+  using Certified = splinesketch::CertifiedSplineSketch;
+  using Paper = splinesketch::CertifiedPaperSplineSketch;
+  // ceil(n/2) = 2^52+1. Converting the odd count to binary64 first
+  // incorrectly selects the last zero instead of the first one.
+  large_count_median(Core(8), Core(8), 52, 0, 1, 1);
+  large_count_median(Certified(8), Certified(8), 52, 0, 1, 1);
+  large_count_median(Core(64), Core(64), 52, 0, 1, 1, true);
+  large_count_median(Certified(64), Certified(64), 52, 0, 1, 1, true);
+  for (auto policy : {Sketch::BoundPolicy::practical, Sketch::BoundPolicy::theoretical}) {
+    large_count_median(Sketch(8, policy), Sketch(8, policy), 52, 0, 1, 1);
+    large_count_median(Sketch(64, policy), Sketch(64, policy), 52, 0, 1, 1, true);
+    // The target itself is now unrepresentable as binary64. Its comparison
+    // must retain the low integer bit after computing the correct target.
+    large_count_median(Sketch(8, policy), Sketch(8, policy), 53, 0, 1, 1);
+  }
+  for (auto policy : {Paper::BoundPolicy::practical, Paper::BoundPolicy::theoretical}) {
+    large_count_median(Paper(8, policy), Paper(8, policy), 52, 0, 1, 1);
+    large_count_median(Paper(64, policy), Paper(64, policy), 52, 0, 1, 1, true);
+    large_count_median(Paper(8, policy), Paper(8, policy), 53, 0, 1, 1);
+    // A singleton integer certificate settles the crossing even when its
+    // displayed rank rounds down, or rounds up to a target not yet reached.
+    large_count_median(Paper(8, policy), Paper(8, policy), 53, 1, 0, 0);
+    large_count_median(Paper(8, policy), Paper(8, policy), 53, 3, 5, 1);
+  }
+}
+
 static void query_checks(const Sketch& s, const std::vector<double>& data) {
   Inspect::check(s);
   std::vector<double> queries = data;
@@ -126,10 +256,11 @@ static void query_checks(const Sketch& s, const std::vector<double>& data) {
   }
   for (double q : {0.0, 0.001, 0.2, 0.5, 0.9, 0.999, 1.0}) {
     const auto x = s.quantile(q);
+    const auto target = reference_target(q, s.count());
     assert(std::isfinite(x));
-    if (q > 0) assert(s.rank(x) >= std::ceil(q * static_cast<long double>(s.count())));
+    if (q > 0) assert(s.rank(x) >= target);
     if (q > 0 && q < 1 && x > *std::min_element(data.begin(), data.end()))
-      assert(s.rank(std::nextafter(x, -INFINITY)) < std::ceil(q * static_cast<long double>(s.count())));
+      assert(s.rank(std::nextafter(x, -INFINITY)) < target);
   }
 }
 
@@ -223,6 +354,8 @@ static void edge_cases() {
 }
 
 int main() {
+  exact_quantile_arithmetic();
+  large_count_quantiles();
   Inspect::reject_illegal_join();
   Inspect::sparse_initialization();
   Inspect::exact_batch_limits();

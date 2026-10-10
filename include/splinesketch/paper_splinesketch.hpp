@@ -160,13 +160,26 @@ class BasicPaperSplineSketch {
     for (const auto& v : heavy_) { lo = std::min(lo, v.first); hi = std::max(hi, v.first); }
     if (q == 0) return lo;
     if (q == 1) return hi;
-    const long double target = std::ceil(q * static_cast<long double>(count_));
+    const auto target = detail::quantile_rank_target(q, count_);
+    const auto certified_reaches = [&](double estimate, RankBounds interval) {
+      // Integer certificates settle crossings which the rounded display can
+      // move across a target. Inside the interval retain the spline policy.
+      if (interval.lower >= target) return true;
+      if (interval.upper < target) return false;
+      return detail::rank_reaches_target(certified_estimate(estimate, interval), target);
+    };
+    const auto query_reaches = [&](double x) {
+      if constexpr (TrackBounds) {
+        const auto result = rank_and_bounds(x);
+        return certified_reaches(result.first, result.second);
+      } else return detail::rank_reaches_target(rank(x), target);
+    };
     const std::size_t exact_size = buffer_.size() + heavy_.size();
     auto low = SplineSketch::ordered_bits(lo), high = SplineSketch::ordered_bits(hi);
     if (exact_size <= 16) {
       while (low < high) {
         const auto mid = low + (high - low) / 2;
-        if (rank(SplineSketch::from_ordered_bits(mid)) >= target) high = mid;
+        if (query_reaches(SplineSketch::from_ordered_bits(mid))) high = mid;
         else low = mid + 1;
       }
       return SplineSketch::from_ordered_bits(low);
@@ -181,16 +194,16 @@ class BasicPaperSplineSketch {
          std::numeric_limits<double>::epsilon());
     const auto reaches = [&](double x) {
       const auto value = spline_rank(nodes_, x) + exact.rank(x);
-      if (std::fabs(value - target) <= slack) return rank(x) >= target;
+      if (std::fabs(value - target) <= slack) return query_reaches(x);
       const auto estimate = static_cast<double>(std::clamp(value, 0.0L, static_cast<long double>(count_)));
       if constexpr (TrackBounds) {
         auto interval = bucket_bounds(nodes_, x);
         const auto added = exact.integer_rank(x);
         interval.lower += added; interval.upper += added;
         const auto certified = certified_estimate(estimate, interval);
-        if (std::fabs(certified - target) <= slack) return rank(x) >= target;
-        return certified >= target;
-      } else return estimate >= target;
+        if (std::fabs(certified - target) <= slack) return query_reaches(x);
+        return certified_reaches(estimate, interval);
+      } else return detail::rank_reaches_target(estimate, target);
     };
     while (low < high) {
       const auto mid = low + (high - low) / 2;

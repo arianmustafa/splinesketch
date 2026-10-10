@@ -119,7 +119,7 @@ static void queries(const Certified& sketch, const std::map<double, std::uint64_
     for (double q : {0.0, 0.01, 0.1, 0.5, 0.9, 0.99, 1.0}) {
       const auto x = sketch.quantile(q);
       assert(std::isfinite(x));
-      const auto target = std::ceil(q * static_cast<long double>(sketch.count()));
+      const auto target = splinesketch::detail::quantile_rank_target(q, sketch.count());
       if (q > 0) assert(sketch.rank(x) >= target);
       if (q > 0 && q < 1 && x > truth.begin()->first)
         assert(sketch.rank(std::nextafter(x, -INFINITY)) < target);

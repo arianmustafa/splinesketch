@@ -297,11 +297,15 @@ class CertifiedSplineSketch {
     const double maximum = envelope_.entry(envelope_.size() - 1).value;
     if (q == 0) return minimum;
     if (q == 1) return maximum;
-    const long double target = std::ceil(q * static_cast<long double>(count()));
+    const auto target = detail::quantile_rank_target(q, count());
     auto low = ordered_bits(minimum), high = ordered_bits(maximum);
     while (low < high) {
       const auto middle = low + (high - low) / 2;
-      if (rank(from_ordered_bits(middle)) >= target) high = middle;
+      const auto x = from_ordered_bits(middle);
+      const auto interval = envelope_.bounds(x);
+      const bool reaches = interval.lower >= target ||
+          (interval.upper >= target && detail::rank_reaches_target(estimate(x, interval), target));
+      if (reaches) high = middle;
       else low = middle + 1;
     }
     return from_ordered_bits(low);
