@@ -1,0 +1,227 @@
+--- a/include/splinesketch/paper_splinesketch.hpp
++++ b/include/splinesketch/paper_splinesketch.hpp
+@@ -224,6 +224,7 @@
+         (buckets > old ? buckets - old : old - buckets) > old / 4;
+     if (reset_protection)
+       updated.clear_protection();
++    updated.rank_resize_ = true;
+     updated.capacity_ = buckets;
+     updated.nodes_.reserve(buckets + 2);
+     updated.buffer_.reserve(5 * buckets);
+@@ -232,6 +233,7 @@
+     updated.shrink_heavy(released);
+     updated.incorporate(released);
+     updated.rebalance({}, false, buckets > old);
++    updated.rank_resize_ = false;
+     // Finish the protection boundary after refinement at the new capacity.
+     if (reset_protection) updated.clear_protection();
+     updated.trim_storage();
+@@ -367,6 +369,8 @@
+   BoundPolicy policy_;
+   long double factor_;
+   bool finalized_ = false;
++  // Experimental: active only while a capacity change rebuilds this copy.
++  bool rank_resize_ = false;
+   std::vector<Node> nodes_;
+   std::vector<double> buffer_;
+   std::unordered_map<double, Heavy> heavy_;
+@@ -759,6 +763,15 @@
+   }
+   long double heuristic(std::size_t i, bool joined = false) const {
+     const std::size_t right = i + static_cast<std::size_t>(joined);
++    if constexpr (TrackBounds) {
++      if (joined && rank_resize_) {
++        JoinCurve curve;
++        const auto first = i > 3 ? i - 3 : 0;
++        for (std::size_t at = first; at < nodes_.size() && curve.used < 7; ++at)
++          curve.nodes[curve.used++] = nodes_[at];
++        return join_curve_score(curve, i - first);
++      }
++    }
+     const long double h = static_cast<long double>(nodes_[right].x) - nodes_[i - 1].x;
+     const long double hp = i > 1 ? static_cast<long double>(nodes_[i - 1].x) - nodes_[i - 2].x : h;
+     const long double hn = right + 1 < nodes_.size() ?
+@@ -771,6 +784,55 @@
+     // candidate legality never depends on this optional heuristic.
+     return std::isfinite(value) ? value : std::numeric_limits<long double>::max();
+   }
++  // Experimental sampled tiebreaker; not an exact distortion supremum.
++  // Translate the local CDF to zero and
++  // compare before/after cubics on the four affected old intervals.
++  struct JoinCurve {
++    std::array<Node, 7> nodes{};
++    std::size_t used = 0;
++    Node& operator[](std::size_t i) { return nodes[i]; }
++    const Node& operator[](std::size_t i) const { return nodes[i]; }
++    auto begin() { return nodes.begin(); }
++    auto end() { return nodes.begin() + static_cast<std::ptrdiff_t>(used); }
++    auto begin() const { return nodes.begin(); }
++    auto end() const { return nodes.begin() + static_cast<std::ptrdiff_t>(used); }
++    Node& back() { return nodes[used - 1]; }
++    std::size_t size() const { return used; }
++  };
++  static long double curve_rank(const JoinCurve& curve, double x) {
++    if (x <= curve[0].x) return curve[0].prefix;
++    if (x >= curve.nodes[curve.used - 1].x) return curve.nodes[curve.used - 1].prefix;
++    const auto it = std::lower_bound(curve.begin(), curve.end(), x,
++        [](const Node& node, double value) { return node.x < value; });
++    if (it->x == x) return it->prefix;
++    const auto& left = *(it - 1); const auto& right = *it;
++    const long double t = fraction(left.x, right.x, x);
++    const long double h = static_cast<long double>(right.x) - left.x;
++    const auto dl = h * left.slope, dr = h * right.slope;
++    if (!std::isfinite(dl) || !std::isfinite(dr)) return left.prefix + t * right.mass;
++    return std::clamp(left.prefix + (3 * t * t - 2 * t * t * t) * right.mass +
++        t * (1 - t) * ((1 - t) * dl - t * dr), left.prefix, right.prefix);
++  }
++  static long double join_curve_score(JoinCurve original, std::size_t removed) {
++    original[0].mass = 0;
++    auto joined = original;
++    joined[removed + 1].mass += joined[removed].mass;
++    for (std::size_t i = removed; i + 1 < joined.used; ++i) joined[i] = joined[i + 1];
++    --joined.used;
++    SplineSketch::rebuild(original); SplineSketch::rebuild(joined);
++    const auto first = removed > 1 ? removed - 2 : 0;
++    const auto last = std::min(original.used - 1, removed + 2);
++    long double score = 0;
++    for (std::size_t i = first + 1; i <= last; ++i)
++      for (unsigned j = 0; j <= 16; ++j) {
++        const long double t = static_cast<long double>(j) / 16;
++        const double x = static_cast<double>((1 - t) * original[i - 1].x + t * original[i].x);
++        const auto difference = std::fabs(curve_rank(original, x) - curve_rank(joined, x));
++        if (!std::isfinite(difference)) return std::numeric_limits<long double>::max();
++        score = std::max(score, difference);
++      }
++    return score;
++  }
+   struct JoinCandidates {
+     using Candidate = std::pair<long double, std::size_t>;
+     std::array<Candidate, 3> best{{{0, npos}, {0, npos}, {0, npos}}};
+@@ -782,6 +844,19 @@
+       return npos;
+     }
+   };
++  bool better_join(const typename JoinCandidates::Candidate& a,
++                   const typename JoinCandidates::Candidate& b) const {
++    // Primary key: maximum pointwise integer width increase on deletion.
++    // Secondary key: sampled local curve distortion, then coordinate.
++    if constexpr (TrackBounds) if (rank_resize_) {
++      const auto width = [&](std::size_t i) {
++        return nodes_[i + 1].upper - nodes_[i + 1].atom - nodes_[i - 1].lower - (nodes_[i].upper - nodes_[i].lower);
++      };
++      const auto x = width(a.second), y = width(b.second);
++      if (x != y) return x < y;
++    }
++    return a < b;
++  }
+   JoinCandidates join_candidates() const {
+     JoinCandidates result;
+     const auto limit = 0.75L * bound();
+@@ -790,7 +865,7 @@
+       ++result.count;
+       const typename JoinCandidates::Candidate candidate{heuristic(i, true), i};
+       for (std::size_t j = 0; j < result.best.size(); ++j)
+-        if (result.best[j].second == npos || candidate < result.best[j]) {
++        if (result.best[j].second == npos || better_join(candidate, result.best[j])) {
+           for (std::size_t at = result.best.size() - 1; at > j; --at) result.best[at] = result.best[at - 1];
+           result.best[j] = candidate;
+           break;
+@@ -858,6 +933,17 @@
+         return kind == mass_heap ? node.mass : kind == split_heap ? node.prefix : node.slope;
+       }
+       bool better(Id a, Id b) const {
++        if constexpr (TrackBounds) {
++          if (kind == join_heap && state.sketch.rank_resize_) {
++            const auto width = [&](Id id) {
++              const auto left = state.links[id].prev, right = state.links[id].next;
++              const auto& nodes = state.sketch.nodes_;
++              return nodes[right].upper - nodes[right].atom - nodes[left].lower - (nodes[id].upper - nodes[id].lower);
++            };
++            const auto x = width(a), y = width(b);
++            if (x != y) return x < y;
++          }
++        }
+         const auto x = key(a), y = key(b);
+         if (x != y) return kind == join_heap ? x < y : x > y;
+         return state.sketch.nodes_[a].x < state.sketch.nodes_[b].x;
+@@ -959,6 +1045,18 @@
+       return mid > sketch.nodes_[left].x && mid < sketch.nodes_[id].x;
+     }
+     long double score(Id id, bool joined) const {
++      if constexpr (TrackBounds) {
++        if (joined && sketch.rank_resize_) {
++          auto first = id;
++          for (unsigned i = 0; i < 3 && links[first].prev != none; ++i) first = links[first].prev;
++          JoinCurve curve; std::size_t removed = 0;
++          for (Id at = first; at != none && curve.used < 7; at = links[at].next) {
++            if (at == id) removed = curve.used;
++            curve.nodes[curve.used++] = sketch.nodes_[at];
++          }
++          return join_curve_score(curve, removed);
++        }
++      }
+       const auto left = links[id].prev;
+       const auto right = joined ? links[id].next : id;
+       const auto previous = links[left].prev, next = links[right].next;
+@@ -1003,10 +1101,10 @@
+       if (heuristic_eligible(id)) splits.insert(id);
+       if (join_eligible(id)) joins.insert(id);
+     }
+-    std::array<Id, 7> detach_neighbours(Id center) {
+-      std::array<Id, 7> affected{{none, none, none, none, none, none, none}};
++    std::array<Id, 9> detach_neighbours(Id center) {
++      std::array<Id, 9> affected{{none, none, none, none, none, none, none, none, none}};
+       auto at = center;
+-      for (unsigned i = 0; i < 2 && links[at].prev != none; ++i) at = links[at].prev;
++      for (unsigned i = 0; i < 3 && links[at].prev != none; ++i) at = links[at].prev;
+       for (auto& id : affected) {
+         if (at == none) break;
+         id = at; at = links[at].next;
+@@ -1117,8 +1215,8 @@
+     }
+     void mark_neighbours(Id center) {
+       auto at = center;
+-      for (unsigned i = 0; i < 2 && links[at].prev != none; ++i) at = links[at].prev;
+-      for (unsigned i = 0; i < 7 && at != none; ++i) {
++      for (unsigned i = 0; i < 3 && links[at].prev != none; ++i) at = links[at].prev;
++      for (unsigned i = 0; i < 9 && at != none; ++i) {
+         mark(at); at = links[at].next;
+       }
+     }
+@@ -1153,7 +1251,17 @@
+             ? snapshot.nodes[old].prefix : spline_rank(snapshot.nodes, x);
+         const long double value = old_rank + (pending ? snapshot.sums[pending - 1] : 0);
+         const long double mass = std::max(0.0L, value - previous);
+-        set_bounds(sketch.nodes_[id], snapshot, old, pending);
++        if constexpr (TrackBounds) {
++          auto updated = sketch.nodes_[id];
++          set_bounds(updated, snapshot, old, pending);
++          // Join keys depend on neighbouring integer bounds. Detach all
++          // affected keys BEFORE mutating an endpoint, even if mass is equal.
++          if (updated.lower != sketch.nodes_[id].lower || updated.upper != sketch.nodes_[id].upper ||
++              updated.atom != sketch.nodes_[id].atom) mark_neighbours(id);
++          sketch.nodes_[id].lower = updated.lower;
++          sketch.nodes_[id].upper = updated.upper;
++          sketch.nodes_[id].atom = updated.atom;
++        }
+         if (mass != sketch.nodes_[id].mass) {
+           mark_neighbours(id);
+           sketch.nodes_[id].mass = mass;
+@@ -1243,7 +1351,7 @@
+         if (!mandatory) {
+           split_id = none;
+           if (growing) split_id = splits.top();
+-          else if (size == sketch.capacity_ && joins.entries.size() >= (sketch.capacity_ + 2) / 3 + 2)
++          else if (!(TrackBounds && sketch.rank_resize_) && size == sketch.capacity_ && joins.entries.size() >= (sketch.capacity_ + 2) / 3 + 2)
+             best_gain(candidates, split_id, join_id);
+         }
+         if (split_id == none) break;
+@@ -1332,7 +1440,7 @@
+             if (can_split(i) && nodes_[i].mass > 0 && heuristic(i) > score) {
+               split = i; score = heuristic(i);
+             }
+-        } else if (nodes_.size() == capacity_ && joins.count >= (capacity_ + 2) / 3 + 2) {
++        } else if (!(TrackBounds && rank_resize_) && nodes_.size() == capacity_ && joins.count >= (capacity_ + 2) / 3 + 2) {
+           long double gain = 0;
+           for (std::size_t i = 1; i < nodes_.size(); ++i) {
+             if (nodes_[i].mass <= 2 * static_cast<long double>(count_) / capacity_ || !can_split(i)) continue;
