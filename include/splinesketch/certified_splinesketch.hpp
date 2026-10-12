@@ -25,6 +25,26 @@ class RankEnvelope {
   struct Insertion { std::size_t index; Entry entry; };
 
   explicit RankEnvelope(std::size_t capacity) : capacity_(capacity) {}
+  RankEnvelope(const RankEnvelope& other)
+      : capacity_(other.capacity_), count_(other.count_), uncertainty_(other.uncertainty_) {
+    // Allocate outside the variant's copy constructor. In libstdc++ 13, a
+    // failed vector copy there can visit an unconstructed alternative while
+    // unwinding. Our storage stays a valid empty vector until copying succeeds.
+    std::visit([&](const auto& entries) {
+      using Entries = std::decay_t<decltype(entries)>;
+      Entries copied(entries);
+      storage_ = std::move(copied);
+    }, other.storage_);
+  }
+  RankEnvelope(RankEnvelope&&) noexcept = default;
+  RankEnvelope& operator=(RankEnvelope&&) noexcept = default;
+  RankEnvelope& operator=(const RankEnvelope& other) {
+    if (this != &other) {
+      RankEnvelope copied(other);
+      *this = std::move(copied);
+    }
+    return *this;
+  }
   std::uint64_t count() const noexcept { return count_; }
   std::size_t capacity() const noexcept { return capacity_; }
   std::size_t size() const noexcept {

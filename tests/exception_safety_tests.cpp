@@ -150,6 +150,20 @@ static void copy_assignment() {
 
 int main() {
   copy_assignment();
+#ifdef SPLINESKETCH_CERTIFIED
+  // Both packed and wide certificate vectors must unwind safely when their
+  // copy allocation fails, including libstdc++'s never-valueless variant path.
+  SplineSketch copy_source(8);
+  copy_source.add(0); copy_source.add(1);
+  for (bool wide : {false, true}) {
+    if (wide) for (unsigned bit = 0; bit < 31; ++bit) copy_source.merge(copy_source);
+    assert(copy_source.count() == (wide ? std::uint64_t{1} << 32 : 2));
+    check_allocation_failures(copy_source, [](SplineSketch& sketch) {
+      const SplineSketch copied(sketch);
+      check_same_state(copied, sketch);
+    }, &copy_source);
+  }
+#endif
 #ifdef SPLINESKETCH_PAPER_CERTIFIED
   // Small selections must remain allocation-free. Larger selections prepare
   // local integer prefixes; every failed allocation must preserve query state.
