@@ -99,9 +99,63 @@ Merging retains the receiver's capacity and leaves a distinct source sketch
 unchanged. Merge order can affect estimates. Increasing capacity later cannot
 recover detail already lost to approximation.
 
+### Optional certificate-midpoint queries
+
+For midpoint queries on `CertifiedPaperSplineSketch`, include
+[`certificate_midpoint.hpp`](include/splinesketch/certificate_midpoint.hpp).
+Copy it together with `paper_splinesketch.hpp` and `splinesketch.hpp`, preserving
+the `splinesketch/` directory. These are optional free functions; the sketch's
+`rank()` and `quantile()` methods keep their spline query policy.
+
+```cpp
+#include <splinesketch/certificate_midpoint.hpp>
+#include <iostream>
+
+int main() {
+    splinesketch::CertifiedPaperSplineSketch sketch(128);
+    for (double value : {1., 2., 2., 4., 8.}) sketch.add(value);
+
+    const auto rank = splinesketch::certificate_midpoint_rank(sketch, 2.);
+    std::cout << rank.estimate << ' ' << rank.max_error << '\n'; // 3 0
+    // True inclusive rank is in [rank.lower_rank, rank.upper_rank].
+    // |rank.estimate - true rank| <= rank.max_error.
+
+    std::cout << splinesketch::certificate_midpoint_max_error(sketch) << '\n'; // 0
+    std::cout << splinesketch::certificate_midpoint_select(sketch, 3) << '\n'; // 2
+}
+```
+
+All functions below belong to the `splinesketch` namespace. The sketch-taking
+functions accept `CertifiedPaperSplineSketch`.
+
+| Function | Description |
+| --- | --- |
+| `certificate_midpoint_rank(sketch, x)` | Return the nearest binary64 midpoint of the integer rank bounds, ties to even, plus those bounds and an outward-rounded maximum absolute error. Reject NaN queries. An empty sketch returns zero rank and zero error. |
+| `certificate_midpoint_max_error(sketch)` | Uniform bound on returned midpoint rank error, including binary64 rounding at large counts. |
+| `certificate_midpoint_select(sketch, target)` | Return the first finite `double` whose exact certificate midpoint reaches an integer target in `[1, sketch.count()]`. It may lie between observations; zero is canonicalized to `+0.0`. Throw `std::logic_error` for an empty sketch and `std::invalid_argument` for an out-of-range target. |
+| `certificate_midpoint(lower, upper)` | Compute the midpoint estimate and error directly from two `std::uint64_t` endpoints. Reject reversed bounds. |
+| `certificate_midpoint_uniform_error(width, count)` | Compute a uniform midpoint rank error bound from a maximum integer certificate width and observation count. Reject `width > count`. |
+
+Midpoint rank queries minimize the worst-case distance to the certificate
+endpoints among `double` estimates. They can still have greater actual error
+than the spline estimate on a particular stream.
+
+Selection compares the exact midpoint, rather than its rounded rank display,
+including above `2^53` observations. Let `W = sketch.max_rank_uncertainty()`
+and let `R(x)` be the true inclusive rank. For the selected value `x` and
+`p = std::nextafter(x, -infinity)`, the distance from the integer target to
+the interval `[R(p), R(x)]` is at most `floor(W / 2)`. This accounts for
+duplicate-value jumps; it does not bound `|R(x) - target|` or error in value
+units. The guarantee depends on the retained certificate width.
+
+Selection scans exact buffered and held observations during the search, so
+it can be slower than `quantile()` when many such observations remain. The
+[query benchmark](benchmarks/paper_certificate_queries.cpp) compares both
+policies on buffered and consolidated states.
+
 ## API
 
-All methods belong to `splinesketch::SplineSketch`. The constructor's bucket
+The method table below describes `splinesketch::SplineSketch`. Bucket
 capacity defaults to `128` and must be between `6` and
 `std::numeric_limits<std::size_t>::max() / 4`. Capacity controls storage and
 bucket resolution; it is not an error tolerance.
@@ -178,6 +232,7 @@ cmake --build build --config Release
 
 ./build/splinesketch_benchmark
 ./build/splinesketch_criteria_benchmark 128
+./build/splinesketch_paper_certificate_query_benchmark
 ./build/splinesketch_accuracy_benchmark
 ```
 
@@ -187,9 +242,10 @@ With a multi-configuration generator, executables are in `build/Release/`.
 | --- | --- |
 | [Throughput](benchmarks/throughput.cpp) | One million normal samples at capacity 128, followed by 100,000 rank and 10,000 quantile queries. Reports microseconds per operation; update timing includes a final consolidation. |
 | [Criteria](benchmarks/criteria.cpp) | 10,000 parts, each updating 30 sketches. Reports mean, p99, p99.9, and maximum milliseconds per part. The optional argument sets capacity, defaulting to 128. Includes automatic consolidations, with no queries or final flush. |
+| [Certificate midpoint queries](benchmarks/paper_certificate_queries.cpp) | Compare spline ranks with error bounds against midpoint ranks, and spline quantiles against integer-rank midpoint selection. Report median nanoseconds per query over five rounds at capacities 16, 128, and 1024, for normal and discrete inputs in buffered and consolidated states. An optional argument selects one capacity. |
 | [Accuracy](benchmarks/accuracy.cpp) | Exact-rank comparison across 5 capacities, 5 data shapes, 3 update workflows, and 3 seeds. Reports median, p95, and worst observed rank error as a percent of stream size. See [method and results](docs/accuracy.md). |
 
-Both timing benchmarks generate input before timing. Throughput queries use the
+The timing benchmarks generate input before timing. Throughput queries use the
 consolidated sketch with its frequency table retained. These are local synthetic
 workloads, not reproductions of the paper's accuracy or storage comparisons.
 
