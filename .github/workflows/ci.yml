@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  tests:
+    name: Tests (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: GCC
+            compiler: g++
+            flags: ''
+          - name: Clang
+            compiler: clang++
+            flags: ''
+          - name: UBSan
+            compiler: g++
+            flags: -fsanitize=undefined,float-cast-overflow -fno-sanitize-recover=all
+    env:
+      CXX: ${{ matrix.compiler }}
+      CXXFLAGS: ${{ matrix.flags }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Configure
+        run: |
+          mkdir -p results
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+            -DSPLINESKETCH_REQUIRE_PYTHON=ON \
+            -DPython3_EXECUTABLE="$(command -v python)" 2>&1 | tee results/configure.log
+      - name: Build
+        run: cmake --build build --parallel 2 2>&1 | tee results/build.log
+      - name: Run tests
+        run: |
+          ctest --test-dir build --parallel 2 --verbose --output-on-failure \
+            --no-tests=error --output-junit "$PWD/results/tests.xml" 2>&1 | tee results/tests.log
+      - name: Summarize tests
+        if: always()
+        run: |
+          python tools/ci_report.py tests --junit results/tests.xml --output results \
+            --compiler "$CXX" --revision "$GITHUB_SHA" --outcome '${{ job.status }}'
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: tests-${{ matrix.name }}
+          path: results/
+          retention-days: 14
+          if-no-files-found: warn
+
+  benchmarks:
+    name: Query benchmarks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      BASE_REVISION: ${{ github.event.pull_request.base.sha || github.event.before }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Compare baseline and changed commit
+        run: |
+          mkdir -p results
+          baseline="$BASE_REVISION"
+          if [[ -z "$baseline" || "$baseline" =~ ^0+$ ]]; then
+            baseline="$(git rev-parse HEAD^ 2>/dev/null || true)"
+          fi
+          if [[ -n "$baseline" ]] && git cat-file -e "$baseline^{commit}"; then
+            git worktree add --detach "$RUNNER_TEMP/benchmark-base" "$baseline" \
+              2>&1 | tee results/baseline-checkout.log
+          else
+            baseline=unavailable
+            mkdir -p "$RUNNER_TEMP/benchmark-base"
+          fi
+          python tools/ci_report.py benchmark --head "$PWD" \
+            --base "$RUNNER_TEMP/benchmark-base" --output results --compiler g++ \
+            --revision "$(git rev-parse HEAD)" --base-revision "$baseline"
+      - name: Report interrupted benchmark
+        if: always()
+        run: |
+          if [[ ! -f results/summary.md ]]; then
+            mkdir -p results
+            printf '## Query benchmarks\n\nBenchmark setup failed or was interrupted. See the job logs.\n' \
+              | tee results/summary.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload benchmark results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: query-benchmarks
+          path: |
+            results/*.csv
+            results/*.json
+            results/*.log
+            results/summary.md
+          retention-days: 14
+          if-no-files-found: warn
