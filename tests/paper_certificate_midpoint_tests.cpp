@@ -1,5 +1,4 @@
-#include <splinesketch/paper_splinesketch.hpp>
-#include "../benchmarks/comparison/experiments/paper_certificate_midpoint.hpp"
+#include <splinesketch/certificate_midpoint.hpp>
 #include "paper_resize_history_fixture.hpp"
 #include <cfenv>
 #include <cstring>
@@ -9,7 +8,21 @@
 #include <vector>
 
 using Sketch = splinesketch::CertifiedPaperSplineSketch;
-using namespace splinesketch::experimental;
+using namespace splinesketch;
+
+template<class T, class = void>
+struct HasMidpointQueries : std::false_type {};
+template<class T>
+struct HasMidpointQueries<T, std::void_t<
+    decltype(certificate_midpoint_rank(std::declval<const T&>(), 0.0)),
+    decltype(certificate_midpoint_max_error(std::declval<const T&>())),
+    decltype(certificate_midpoint_select(std::declval<const T&>(), std::uint64_t{1}))>>
+    : std::true_type {};
+static_assert(HasMidpointQueries<Sketch>::value, "certified midpoint API missing");
+static_assert(!HasMidpointQueries<PaperSplineSketch>::value,
+              "plain paper sketches do not carry integer certificates");
+static_assert(!HasMidpointQueries<SplineSketch>::value,
+              "midpoint API is scoped to the certified paper engine");
 
 static void require(bool condition, const char* message) {
   if (!condition) throw std::runtime_error(message);
@@ -109,6 +122,10 @@ static void arithmetic_checks() {
   catch (const std::invalid_argument&) { rejected = true; }
   require(rejected, "impossible uniform width accepted");
   Sketch empty(8);
+  const auto empty_rank = certificate_midpoint_rank(empty, 0);
+  require(empty_rank.estimate == 0 && empty_rank.lower_rank == 0 && empty_rank.upper_rank == 0 &&
+          empty_rank.max_error == 0 && certificate_midpoint_max_error(empty) == 0,
+          "empty midpoint rank or uniform error not zero");
   rejected = false;
   try { certificate_midpoint_select(empty, 1); } catch (const std::logic_error&) { rejected = true; }
   require(rejected, "empty selection accepted");
@@ -133,6 +150,7 @@ struct Comparison {
 };
 
 static void check_state(const Sketch& sketch, std::vector<double> data, Comparison& comparison) {
+  const auto baseline = sketch;
   std::sort(data.begin(), data.end());
   require(sketch.count() == data.size(), "count changed by query adapter");
   comparison.partition_queries += check_monotone_partition(sketch);
@@ -182,6 +200,7 @@ static void check_state(const Sketch& sketch, std::vector<double> data, Comparis
     const auto truth = static_cast<std::uint64_t>(std::upper_bound(data.begin(), data.end(), query) - data.begin());
     const auto projected = sketch.rank_with_error(query);
     const auto r = certificate_midpoint_rank(sketch, query);
+    require(bits(sketch.rank(query)) == bits(baseline.rank(query)), "optional query changed default rank");
     require(r.lower_rank == projected.lower_rank && r.upper_rank == projected.upper_rank,
             "adapter changed integer certificate");
     require(r.lower_rank <= truth && truth <= r.upper_rank, "certificate excludes truth");
@@ -200,6 +219,13 @@ static void check_state(const Sketch& sketch, std::vector<double> data, Comparis
   else if (midpoint_worst > projected_worst) ++comparison.worse;
   else ++comparison.equal;
   comparison.queries += queries.size();
+  require(sketch.count() == baseline.count() && sketch.bucket_capacity() == baseline.bucket_capacity() &&
+          sketch.bucket_count() == baseline.bucket_count() && sketch.heavy_hitter_count() == baseline.heavy_hitter_count() &&
+          sketch.finalized() == baseline.finalized() && sketch.max_rank_uncertainty() == baseline.max_rank_uncertainty(),
+          "optional queries changed sketch state");
+  if (sketch.count())
+    for (double q : {0., 0.1, 0.5, 0.9, 1.})
+      require(bits(sketch.quantile(q)) == bits(baseline.quantile(q)), "optional queries changed default quantile");
 }
 
 static void history_checks(bool theoretical, Comparison& comparison) {
@@ -302,7 +328,7 @@ static void intervals() {
     for (auto target : targets) {
       if (!first) std::cout << ',';
       first = false;
-      std::cout << '[' << target << ',' << midpoint_detail::reaches(lower, upper, target) << ']';
+      std::cout << '[' << target << ',' << detail::midpoint::reaches(lower, upper, target) << ']';
     }
     std::cout << "]}\n";
   }

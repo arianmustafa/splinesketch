@@ -214,6 +214,8 @@ endif()
 
 option(SPLINESKETCH_BUILD_BENCHMARK "Build the timing benchmarks" OFF)
 if(SPLINESKETCH_BUILD_BENCHMARK)
+  add_executable(splinesketch_paper_certificate_query_benchmark benchmarks/paper_certificate_queries.cpp)
+  target_link_libraries(splinesketch_paper_certificate_query_benchmark PRIVATE splinesketch)
   add_executable(splinesketch_benchmark benchmarks/throughput.cpp)
   target_link_libraries(splinesketch_benchmark PRIVATE splinesketch)
   add_executable(splinesketch_criteria_benchmark benchmarks/criteria.cpp)
