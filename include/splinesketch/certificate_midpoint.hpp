@@ -175,16 +175,35 @@ inline double certificate_midpoint_max_error(const CertifiedPaperSplineSketch& s
 inline double certificate_midpoint_select(const CertifiedPaperSplineSketch& sketch, std::uint64_t target) {
   if (!sketch.count()) throw std::logic_error("selection from empty sketch");
   if (!target || target > sketch.count()) throw std::invalid_argument("rank target must be in [1,count]");
-  auto low = detail::midpoint::ordered_bits(-std::numeric_limits<double>::max());
-  auto high = detail::midpoint::ordered_bits(std::numeric_limits<double>::max());
-  while (low < high) {
-    const auto middle = low + (high - low) / 2;
-    const auto bounds = sketch.rank_bounds(detail::midpoint::from_ordered_bits(middle));
-    if (detail::midpoint::reaches(bounds.lower, bounds.upper, target)) high = middle;
-    else low = middle + 1;
-  }
-  const auto value = detail::midpoint::from_ordered_bits(low);
-  return value == 0 ? 0.0 : value;
+  const auto select = [&](const auto& bounds_at) {
+    auto low = detail::midpoint::ordered_bits(-std::numeric_limits<double>::max());
+    auto high = detail::midpoint::ordered_bits(std::numeric_limits<double>::max());
+    while (low < high) {
+      const auto middle = low + (high - low) / 2;
+      const auto bounds = bounds_at(detail::midpoint::from_ordered_bits(middle));
+      if (detail::midpoint::reaches(bounds.lower, bounds.upper, target)) high = middle;
+      else low = middle + 1;
+    }
+    const auto value = detail::midpoint::from_ordered_bits(low);
+    return value == 0 ? 0.0 : value;
+  };
+  const auto exact_size = sketch.buffer_.size() + sketch.heavy_.size();
+  if (exact_size <= 16) return select([&](double x) { return sketch.rank_bounds(x); });
+  CertifiedPaperSplineSketch::Snapshot exact;
+  exact.items.reserve(exact_size);
+  for (double value : sketch.buffer_) exact.items.emplace_back(value, 1);
+  for (const auto& item : sketch.heavy_) exact.items.emplace_back(item.first, item.second.exact);
+  exact.prepare();
+  // Sorting and combining equal keys preserves their integer inclusive CDF.
+  // Prefix sums cannot overflow: the total exact mass is at most count. Add
+  // that same mass to the unchanged grid bounds without copying the grid.
+  // Small states retain allocation-free scans; all scratch state is local.
+  return select([&](double x) {
+    auto bounds = CertifiedPaperSplineSketch::bucket_bounds(sketch.nodes_, x);
+    const auto mass = exact.integer_rank(x);
+    bounds.lower += mass; bounds.upper += mass;
+    return bounds;
+  });
 }
 
 } // namespace splinesketch

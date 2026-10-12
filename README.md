@@ -148,8 +148,10 @@ the interval `[R(p), R(x)]` is at most `floor(W / 2)`. This accounts for
 duplicate-value jumps; it does not bound `|R(x) - target|` or error in value
 units. The guarantee depends on the retained certificate width.
 
-Selection scans exact buffered and held observations during the search, so
-it can be slower than `quantile()` when many such observations remain. The
+Selection uses direct scans for at most 16 buffered and held entries. For
+larger states, it sorts and combines those entries once per query and uses
+integer prefix counts during the search. This requires temporary storage
+proportional to the number of entries. The
 [query benchmark](benchmarks/paper_certificate_queries.cpp) compares both
 policies on buffered and consolidated states.
 

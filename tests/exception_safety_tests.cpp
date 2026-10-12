@@ -1,5 +1,8 @@
 #if defined(SPLINESKETCH_PAPER) || defined(SPLINESKETCH_PAPER_CERTIFIED)
 #include <splinesketch/paper_splinesketch.hpp>
+#ifdef SPLINESKETCH_PAPER_CERTIFIED
+#include <splinesketch/certificate_midpoint.hpp>
+#endif
 #elif defined(SPLINESKETCH_CERTIFIED)
 #include <splinesketch/certified_splinesketch.hpp>
 #else
@@ -147,6 +150,24 @@ static void copy_assignment() {
 
 int main() {
   copy_assignment();
+#ifdef SPLINESKETCH_PAPER_CERTIFIED
+  // Small selections must remain allocation-free. Larger selections prepare
+  // local integer prefixes; every failed allocation must preserve query state.
+  SplineSketch small(32);
+  for (int i = 0; i < 16; ++i) small.add(i);
+  allocations_before_failure = 0;
+  const auto selected = splinesketch::certificate_midpoint_select(small, 8);
+  allocations_before_failure = -1;
+  assert(selected == 7);
+  SplineSketch large(64);
+  for (int i = 0; i < 200; ++i) large.add(i % 31);
+  large.consolidate();
+  for (int i = 0; i < 100; ++i) large.add(i % 47);
+  const auto expected = splinesketch::certificate_midpoint_select(large, 150);
+  check_allocation_failures(large, [&](SplineSketch& sketch) {
+    assert(splinesketch::certificate_midpoint_select(sketch, 150) == expected);
+  }, &large);
+#endif
   SplineSketch empty(6);
   check_allocation_failures(empty, [](SplineSketch& sketch) { sketch.add(1.0); });
 

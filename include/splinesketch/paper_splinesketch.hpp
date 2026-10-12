@@ -10,6 +10,7 @@ namespace splinesketch {
 // Transition checks are enforced in ordinary builds, not just in tests.
 template<bool TrackBounds>
 class BasicPaperSplineSketch {
+  friend double certificate_midpoint_select(const BasicPaperSplineSketch<true>&, std::uint64_t);
 #ifdef SPLINESKETCH_TESTING
   friend struct PaperSplineSketchInspector;
   friend struct PaperCertificateInspector;
@@ -340,7 +341,9 @@ class BasicPaperSplineSketch {
     std::vector<Item> items;
     std::vector<std::uint64_t> sums;
     void prepare() {
-      std::sort(items.begin(), items.end());
+      // Equal-key weights are summed below; their relative order is irrelevant.
+      std::sort(items.begin(), items.end(),
+          [](const Item& a, const Item& b) { return a.first < b.first; });
       std::size_t out = 0;
       for (auto item : items) {
         if (out && items[out - 1].first == item.first) items[out - 1].second += item.second;

@@ -195,7 +195,9 @@ def main():
     selection_rows = [json.loads(line) for line in subprocess.check_output(
         [executable, '--selection-fixtures'], text=True).splitlines()]
     expected_cases = {f'{case}-{policy}' for policy in ('practical', 'theoretical')
-                      for case in ('cluster', 'tight', 'duplicates', 'rounded-terminal', 'raw', 'finalized', 'large-53', 'large-63')}
+                      for case in ('cluster', 'tight', 'duplicates', 'rounded-terminal', 'raw', 'finalized',
+                                   'pending-16', 'pending-17', 'pending-257', 'mixed', 'weighted-prepared',
+                                   'large-53', 'large-63')}
     assert len(selection_rows) == len(expected_cases) and {row['case'] for row in selection_rows} == expected_cases
     selection_checks = sum(check_selection(row) for row in selection_rows)
     # Reachable endpoint witness: the certificate minimax radius is attained

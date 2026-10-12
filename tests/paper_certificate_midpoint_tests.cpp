@@ -36,6 +36,9 @@ static std::uint64_t bits(double value) {
 
 namespace splinesketch {
 struct PaperCertificateInspector {
+  static std::size_t exact_size(const Sketch& sketch) {
+    return sketch.buffer_.size() + sketch.heavy_.size();
+  }
   static std::vector<double> partition(const Sketch& sketch) {
     std::vector<double> queries{-INFINITY, INFINITY};
     const auto append = [&](double key) {
@@ -466,6 +469,58 @@ static void selection_fixtures() {
     emit_selection_case(theoretical ? "raw-theoretical" : "raw-practical", raw, raw_data, {1, 2, 3, 4, 5, 6});
     raw.finalize();
     emit_selection_case(theoretical ? "finalized-theoretical" : "finalized-practical", raw, raw_data, {1, 2, 3, 4, 5, 6});
+
+    // Exercise both sides of the direct-scan threshold, duplicate compression,
+    // and extreme keys in a pending buffer, then combine it with held atoms.
+    Sketch prepared(64, policy);
+    WeightedData prepared_data;
+    for (unsigned i = 0; i < 257; ++i) {
+      const double value = i < raw_data.size() ? raw_data[i].first : static_cast<double>(i % 31) - 15;
+      prepared.add(value); prepared_data.emplace_back(value, 1);
+      if (i != 15 && i != 16 && i != 256) continue;
+      targets.clear();
+      for (std::uint64_t target = 1; target <= prepared.count(); ++target) targets.push_back(target);
+      const auto name = std::string("pending-") + std::to_string(i + 1) +
+                        (theoretical ? "-theoretical" : "-practical");
+      emit_selection_case(name.c_str(),
+                          prepared, prepared_data, targets);
+    }
+    prepared.consolidate();
+    for (unsigned i = 0; i < 97; ++i) {
+      prepared.add(static_cast<double>(i % 31) - 15);
+      prepared_data.emplace_back(static_cast<double>(i % 31) - 15, 1);
+    }
+    require(PaperCertificateInspector::exact_size(prepared) > 16, "mixed prepared path not exercised");
+    targets = {1, 16, 17, 128, 257, prepared.count()};
+    emit_selection_case(theoretical ? "mixed-theoretical" : "mixed-practical", prepared, prepared_data, targets);
+
+    // Reach UINT64_MAX through public updates while retaining >16 exact keys.
+    // This checks integer prefix additions where binary64 loses many low bits.
+    Sketch weighted(64, policy);
+    WeightedData weighted_data;
+    for (unsigned i = 0; i < 32; ++i) weighted_data.emplace_back(static_cast<double>(i) - 16, 0);
+    weighted.add(-16); weighted_data[0].second = 1;
+    for (unsigned step = 1; step <= 63; ++step) {
+      weighted.merge(weighted);
+      for (auto& item : weighted_data) item.second *= 2;
+      weighted.add(weighted_data[step % 32].first);
+      ++weighted_data[step % 32].second;
+      weighted.consolidate();
+    }
+    require(weighted.count() == std::numeric_limits<std::uint64_t>::max() &&
+            PaperCertificateInspector::exact_size(weighted) > 16,
+            "large weighted prepared path not exercised");
+    targets = {1, weighted.count()};
+    std::uint64_t prefix = 0;
+    for (const auto& item : weighted_data) {
+      prefix += item.second;
+      targets.push_back(prefix);
+      if (prefix < weighted.count()) targets.push_back(prefix + 1);
+    }
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+    emit_selection_case(theoretical ? "weighted-prepared-theoretical" : "weighted-prepared-practical",
+                        weighted, weighted_data, targets);
 
     Sketch large(8, policy); large.add(0);
     std::uint64_t zeros = 1;
