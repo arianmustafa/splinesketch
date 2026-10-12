@@ -9,6 +9,13 @@ namespace detail {
 // An integer rank envelope. Entries stand for retained, ordered occurrences;
 // equal keys remain separate. See docs/certified-rank-proofs.md.
 class RankEnvelope {
+  // Define before the std::visit lambdas: Clang 14 instantiates their calls
+  // while parsing those lambdas and otherwise leaves this template undefined.
+  template<class Entries>
+  static std::size_t upper(const Entries& entries, double value) noexcept {
+    return static_cast<std::size_t>(std::upper_bound(entries.begin(), entries.end(), value,
+        [](double key, const auto& entry) { return key < entry.value; }) - entries.begin());
+  }
  public:
   struct Entry {
     double value;
@@ -134,11 +141,6 @@ class RankEnvelope {
     wide.reserve(small.capacity());
     for (const auto& entry : small) wide.push_back(widen(entry));
     storage_.emplace<1>(std::move(wide));
-  }
-  template<class Entries>
-  static std::size_t upper(const Entries& entries, double value) noexcept {
-    return static_cast<std::size_t>(std::upper_bound(entries.begin(), entries.end(), value,
-        [](double key, const auto& entry) { return key < entry.value; }) - entries.begin());
   }
   template<class Entries>
   Bounds before(const Entries& entries, std::size_t next) const noexcept {
